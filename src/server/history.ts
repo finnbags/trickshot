@@ -21,7 +21,7 @@ import { densityMap } from "./density";
 import { estimateSeconds, estimateWindow } from "./estimate";
 import { walletGraph, type Related, type WalletGraph } from "./graph";
 import { identify, tokenIdentity } from "./identity";
-import { charge, checkBudget, metered, spentSoFar } from "./meter";
+import { charge, checkBudget, currentCaller, metered, spentSoFar } from "./meter";
 import { recordSpend } from "./budget";
 import {
   accountKeys,
@@ -137,7 +137,9 @@ async function priced<T>(
     label,
     run,
     (spend) => {
-      void recordSpend(spend.credits);
+      // Attributed to the caller as well as the day, so a visitor replaying
+      // indexed tokens is bounded by the same budget a builder is.
+      void recordSpend(spend.credits, currentCaller());
       const kinds = Object.entries(spend.byKind)
         .map(([kind, k]) => `${kind} ${k.calls}×${k.credits}`)
         .join(", ");
@@ -2266,12 +2268,31 @@ export class TooLarge extends Error {
  * Unbounded, because this is the owner's budget being spent once for everyone
  * who asks for that token afterwards.
  */
+/**
+ * Bars one queued build may draw.
+ *
+ * A whole-life chart is capped at `MAX_BUCKETS` (400) — `pickInterval` widens
+ * the bar until the token fits. Nothing capped a WINDOW, so a job could carry
+ * one seven times larger than any chart the app would draw itself: MEASURED,
+ * 2,833 bars at 900s, estimated at 481,780 credits. The cap is generous
+ * against a real wallet window (~460 bars at worst) and refuses the ones that
+ * can only come from a merge that went wrong.
+ */
+const BUILD_MAX_BARS = Number(process.env.BUILD_MAX_BARS ?? 1_000);
+
 export async function buildWindow(
   mint: string,
   interval: number,
   from: number,
   to: number,
 ): Promise<number> {
+  const bars = Math.ceil((to - from) / interval);
+  if (bars > BUILD_MAX_BARS) {
+    console.error(
+      `[history] refusing ${mint} @${interval}s: ${bars} bars, over ${BUILD_MAX_BARS}`,
+    );
+    return 0;
+  }
   return priced(`build ${mint} @${interval}s`, async () => {
     const venue = await stage("venue", () => venueFor(mint));
     if (!venue) return 0;

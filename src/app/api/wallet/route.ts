@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { owner, readOnly } from "@/server/config";
 import { identify, tokenIdentity } from "@/server/identity";
 import { tokenRow } from "@/server/store";
+import { callerIp } from "@/server/budget";
+import { withCaller } from "@/server/meter";
 import { queued } from "@/server/queue";
 import { tradedOnMany } from "@/server/history";
 import { tradedMints } from "@/server/wallet";
@@ -34,6 +36,11 @@ const MAX_ROWS = Number(process.env.WALLET_MAX_ROWS ?? 50);
 const MAX_ENRICH = Number(process.env.WALLET_MAX_ENRICH ?? 10);
 
 export async function GET(request: Request) {
+  // Billed to the caller, like every other path that can spend.
+  return withCaller(callerIp(request), () => handle(request));
+}
+
+async function handle(request: Request) {
   const params = new URL(request.url).searchParams;
   const wallet = params.get("address")?.trim() ?? "";
   if (!isAddress(wallet)) {

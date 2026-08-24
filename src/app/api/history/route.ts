@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { owner } from "@/server/config";
 import { callerIp, mayBuild, releaseBuildSlot, takeBuildSlot } from "@/server/budget";
-import { BudgetExceeded } from "@/server/meter";
+import { BudgetExceeded, withCaller } from "@/server/meter";
 import { enqueue } from "@/server/queue";
 import {
   coverageOf,
@@ -26,6 +26,16 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
 export async function GET(request: Request) {
+  /**
+   * Every credit this request spends is billed to the caller.
+   *
+   * Set once, here, rather than passed down: the spending happens five layers
+   * in, and a parameter threaded that far is one a future call site forgets.
+   */
+  return withCaller(callerIp(request), () => handle(request));
+}
+
+async function handle(request: Request) {
   const { searchParams } = new URL(request.url);
   const mint = searchParams.get("mint")?.trim() ?? "";
   const wallet = searchParams.get("wallet")?.trim() || undefined;

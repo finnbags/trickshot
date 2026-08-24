@@ -96,6 +96,28 @@ export class BudgetExceeded extends Error {
 const store = new AsyncLocalStorage<Spend>();
 
 /**
+ * Who to bill this request to, carried alongside the count.
+ *
+ * The per-visitor limits used to count BUILDS, and only builds of mints the
+ * site had never seen — so a visitor replaying wallet after wallet on tokens
+ * that were already indexed spent real credits and incremented nothing.
+ * MEASURED in production: 2.1 million credits recorded as "1 build".
+ *
+ * Counting spend rather than builds fixes the category error. The caller is
+ * carried out of band for the same reason the counter is: threading it through
+ * every function that might spend is a change nobody remembers to make.
+ */
+const caller = new AsyncLocalStorage<string>();
+
+export function withCaller<T>(ip: string, run: () => Promise<T>): Promise<T> {
+  return caller.run(ip, run);
+}
+
+export function currentCaller(): string | null {
+  return caller.getStore() ?? null;
+}
+
+/**
  * Count everything the given work does, and hand back the total with it.
  *
  * Nested calls JOIN the outer scope rather than opening their own. The

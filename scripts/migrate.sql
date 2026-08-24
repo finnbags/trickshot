@@ -199,6 +199,51 @@ create table if not exists trickshot_jobs (
 create index if not exists trickshot_jobs_next
   on trickshot_jobs (status, requests desc, at);
 
+-- Fold a window into a job's list, widening only where spans OVERLAP.
+--
+-- The first version was `windows || p_window`, which appended: asking twice
+-- for the same token stored the same span twice and the worker built it twice.
+-- Matching on bar width alone and taking min/max is the opposite mistake —
+-- two wallets that both want 900s bars but traded a month apart become one
+-- window spanning that month, MEASURED at 2,833 bars against a whole-life
+-- chart's cap of 400.
+--
+-- Overlapping spans are genuinely cheaper as one build, because the middle is
+-- read once. Disjoint ones are two builds either way.
+create or replace function trickshot_merge_window(p_windows jsonb, p_window jsonb)
+returns jsonb
+language sql immutable
+as $$
+  select case
+    when p_window is null then p_windows
+    -- Nothing it overlaps: keep it separate, up to a bounded number of rungs.
+    when not exists (
+      select 1 from jsonb_array_elements(p_windows) w
+       where (w->>'interval')::bigint = (p_window->>'interval')::bigint
+         and (p_window->>'from')::bigint <= (w->>'to')::bigint
+         and (p_window->>'to')::bigint   >= (w->>'from')::bigint
+    ) then
+      case when jsonb_array_length(p_windows) >= 6 then p_windows
+           else p_windows || jsonb_build_array(p_window) end
+    else (
+      select jsonb_agg(
+        case
+          when (w->>'interval')::bigint = (p_window->>'interval')::bigint
+           and (p_window->>'from')::bigint <= (w->>'to')::bigint
+           and (p_window->>'to')::bigint   >= (w->>'from')::bigint
+          then jsonb_build_object(
+                 'interval', (w->>'interval')::bigint,
+                 'from', least((w->>'from')::bigint, (p_window->>'from')::bigint),
+                 'to',   greatest((w->>'to')::bigint, (p_window->>'to')::bigint))
+          else w
+        end)
+      from jsonb_array_elements(p_windows) w
+    )
+  end;
+$$;
+
+grant execute on function trickshot_merge_window(jsonb, jsonb) to service_role;
+
 -- Ask for a build, or join the ask already standing.
 --
 -- The dedup, and the whole reason this is affordable: ten people wanting the
@@ -224,8 +269,7 @@ begin
       attempts = case when status in ('done','failed') then 0 else attempts end,
       error    = case when status in ('done','failed') then null else error end,
       at       = case when status in ('done','failed') then p_at_now() else at end,
-      windows  = case when p_window is null then windows
-                      else windows || p_window end
+      windows  = trickshot_merge_window(windows, p_window)
     where mint = p_mint
     returning * into row;
     return row;

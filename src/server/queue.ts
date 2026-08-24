@@ -140,6 +140,8 @@ export interface Job {
 
 const KEY = "jobs:queue";
 const MAX_DEPTH = Number(process.env.QUEUE_MAX_DEPTH ?? 50);
+/** Distinct charts one job may carry. See `merge`. */
+const MAX_WINDOWS = Number(process.env.QUEUE_MAX_WINDOWS ?? 6);
 const MAX_ATTEMPTS = Number(process.env.QUEUE_MAX_ATTEMPTS ?? 2);
 /** A claim older than this is assumed dead and may be taken again. */
 const STALE_SEC = Number(process.env.QUEUE_STALE_SEC ?? 900);
@@ -185,8 +187,27 @@ export interface Enqueued {
 /** Widen an existing rung to cover a new ask, or add the rung. */
 function merge(windows: Window[], next?: Window): Window[] {
   if (!next) return windows;
-  const held = windows.find((w) => w.interval === next.interval);
-  if (!held) return [...windows, next];
+  /**
+   * Widened only where the spans actually OVERLAP.
+   *
+   * Matching on bar width alone and taking min/max was the mistake, and an
+   * expensive one: two wallets that both happen to want 900s bars but traded
+   * a month apart merged into a single window spanning that month — MEASURED,
+   * 2,833 bars, estimated at 481,780 credits, for a chart the app would never
+   * draw itself (a whole-life chart is capped at 400 bars).
+   *
+   * Overlapping spans genuinely are cheaper as one build, because the middle
+   * is read once. Disjoint ones are two builds either way, and merging them
+   * adds everything in between for nothing.
+   */
+  const held = windows.find(
+    (w) => w.interval === next.interval && next.from <= w.to && next.to >= w.from,
+  );
+  if (!held) {
+    // Bounded: a token nobody agrees on the shape of is not worth unbounded
+    // work, and the tail here is rungs one visitor each asked for.
+    return windows.length >= MAX_WINDOWS ? windows : [...windows, next];
+  }
   held.from = Math.min(held.from, next.from);
   held.to = Math.max(held.to, next.to);
   return windows;

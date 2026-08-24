@@ -100,9 +100,28 @@ const today = () => new Date().toISOString().slice(0, 10);
  * accounting records nothing for it — the one request that most needed to be
  * counted would be the one that never was.
  */
-export async function recordSpend(credits: number): Promise<void> {
-  if (credits <= 0 || DAILY_CREDITS <= 0) return;
-  await bump(`spend:${today()}`, Math.round(credits), 36 * 3_600);
+export async function recordSpend(credits: number, ip?: string | null): Promise<void> {
+  if (credits <= 0) return;
+  const n = Math.round(credits);
+  if (DAILY_CREDITS > 0) await bump(`spend:${today()}`, n, 36 * 3_600);
+  // Attributed as well as totalled, so one visitor cannot quietly account for
+  // the whole day inside limits that only ever counted builds.
+  if (ip && VISITOR_CREDITS > 0) await bump(`spend:ip:${today()}:${ip}`, n, 24 * 3_600);
+}
+
+/**
+ * Credits one visitor may spend in a day, across everything.
+ *
+ * The limit that actually binds, because it does not care what KIND of request
+ * spent it: a hundred replays of indexed tokens and one cold build are the
+ * same money, and the build counters only ever saw the second.
+ */
+const VISITOR_CREDITS = Number(process.env.VISITOR_CREDITS_PER_DAY ?? 150_000);
+
+export async function withinVisitorBudget(ip: string): Promise<boolean> {
+  if (VISITOR_CREDITS <= 0) return true;
+  const spent = await bump(`spend:ip:${today()}:${ip}`, 0, 24 * 3_600);
+  return spent < VISITOR_CREDITS;
 }
 
 export async function withinDailyBudget(): Promise<boolean> {
@@ -182,6 +201,7 @@ export async function mayBuild(
 ): Promise<Allowance> {
   if (buildsDisabled()) return { ok: false, reason: "disabled" };
   if (!(await withinDailyBudget())) return { ok: false, reason: "budget" };
+  if (!(await withinVisitorBudget(ip))) return { ok: false, reason: "ip" };
 
   const day = today();
 
@@ -250,7 +270,7 @@ export async function usage(): Promise<{
   credits: { spent: number; limit: number; pct: number | null };
   builds: { today: number; limit: number };
   concurrent: { running: number; limit: number };
-  perVisitor: { perIp: number; perWallet: number };
+  perVisitor: { perIp: number; perWallet: number; creditsPerDay: number };
 }> {
   const day = today();
   const [spent, builds, running] = await Promise.all([
@@ -282,6 +302,10 @@ export async function usage(): Promise<{
     },
     builds: { today: builds, limit: MAX_BUILDS_PER_DAY },
     concurrent: { running: Math.max(0, running), limit: MAX_CONCURRENT },
-    perVisitor: { perIp: BUILDS_PER_IP, perWallet: BUILDS_PER_WALLET },
+    perVisitor: {
+      perIp: BUILDS_PER_IP,
+      perWallet: BUILDS_PER_WALLET,
+      creditsPerDay: VISITOR_CREDITS,
+    },
   };
 }
