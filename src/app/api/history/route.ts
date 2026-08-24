@@ -1,6 +1,17 @@
 import { NextResponse } from "next/server";
-import { readOnly } from "@/server/config";
-import { indexed, reconstruct, replayFrom } from "@/server/history";
+import { owner } from "@/server/config";
+import { callerIp, mayBuild, releaseBuildSlot, takeBuildSlot } from "@/server/budget";
+import { BudgetExceeded } from "@/server/meter";
+import { enqueue } from "@/server/queue";
+import {
+  coverageOf,
+  OWNER_LIMITS,
+  reconstruct,
+  replayFrom,
+  TooLarge,
+  VISITOR_LIMITS,
+  walletReplay,
+} from "@/server/history";
 
 /**
  * Rebuild a token from the chain, and optionally one wallet's trades on it.
@@ -48,40 +59,218 @@ export async function GET(request: Request) {
   }
 
   /**
-   * Replaying is always allowed; INDEXING is not.
+   * What has been built decides which PATH serves this, not whether it may.
    *
-   * A visitor who pastes an unknown mint gets told it is not on the site
-   * rather than silently building it. Everything already indexed — including
-   * any wallet on it — is served to everyone.
+   * The distinction matters because a wallet replay and a whole-life rebuild
+   * arrive at the same endpoint and differ in cost by roughly four thousand
+   * times. A wallet request is bounded by the wallet's own history and is the
+   * one build a visitor may start; a mint alone is the token's entire life
+   * across every bar, which is owner-only.
+   *
+   * So coverage is read for what it says — `full` means there IS a whole-life
+   * chart to serve — and never as permission to make one. A `window` row was
+   * written by some visitor replaying a wallet; treating it as authorisation
+   * would let anyone promote a cheap request into an expensive one just by
+   * asking twice.
    */
-  if (readOnly() && !(await indexed(mint))) {
+  const coverage = await coverageOf(mint);
+  if (!wallet && coverage !== "full" && !owner(request)) {
     return NextResponse.json(
-      { error: "that token is not on this site yet" },
+      {
+        error: coverage
+          ? "only one wallet's window has been built for this token — try a wallet"
+          : "that token is not on this site yet — try your wallet",
+      },
       { status: 404 },
     );
   }
 
   try {
-    const history = await reconstruct(mint, wallet, lead, alongside, section);
+    /**
+     * Two different requests, kept apart.
+     *
+     * A wallet replay reads one wallet's own history and draws only the window
+     * it traded in; a mint alone reconstructs the token's entire life. They
+     * used to share one call with the wallet as an optional argument, which
+     * meant a wallet with nothing on the mint quietly became the expensive
+     * one.
+     */
+    if (wallet) {
+      /**
+       * Building the window is what costs; replaying an indexed one does not.
+       *
+       * So the allowance is spent only when this request would actually build
+       * something. Charging every replay would make the site unusable for the
+       * exact person it is for — someone stepping through their own trades on
+       * tokens that are already here.
+       */
+      const isOwner = owner(request);
+      const willBuild = !isOwner && (await coverageOf(mint)) === null;
+      let slot = false;
+      if (willBuild) {
+        const allowed = await mayBuild(callerIp(request), wallet);
+        // Capacity is separate from allowance: the visitor may be entitled to
+        // a build and the site may still be busy doing three others.
+        if (allowed.ok && !(await takeBuildSlot())) allowed.reason = "busy";
+        slot = allowed.ok && allowed.reason !== "busy";
+        if (!allowed.ok || allowed.reason === "busy") {
+          /**
+           * "Come back later" and "you have had enough" are different answers.
+           *
+           * Everything site-wide is transient — capacity, the day's budget, the
+           * day's build count — so it gets a 503 and a Retry-After. Only the
+           * per-person limits are about the caller, and only those get a 429.
+           */
+          const transient =
+            allowed.reason === "busy" ||
+            allowed.reason === "budget" ||
+            allowed.reason === "total" ||
+            allowed.reason === "disabled";
+          return NextResponse.json(
+            {
+              error: transient
+                ? "the site is at capacity right now — try again shortly"
+                : "you have built a lot of new tokens today; try again tomorrow",
+            },
+            {
+              status: transient ? 503 : 429,
+              headers: transient ? { "retry-after": allowed.reason === "busy" ? "30" : "600" } : undefined,
+            },
+          );
+        }
+      }
+
+      let built;
+      try {
+        built = await walletReplay(
+          mint,
+          wallet,
+          lead,
+          alongside,
+          isOwner ? OWNER_LIMITS : VISITOR_LIMITS,
+          section,
+        );
+      } finally {
+        // Released however this ends — including the refusal that queues it,
+        // which is the common case and the one most likely to leak a slot.
+        if (slot) await releaseBuildSlot();
+      }
+      if (!built) {
+        return NextResponse.json(
+          { error: "no trades found for this wallet on this mint" },
+          { status: 404 },
+        );
+      }
+      // The wallet's own window replaces the token-wide one, so the replay
+      // opens on its trades rather than on the token's whole life.
+      const replay = replayFrom(
+        mint,
+        wallet,
+        built.history.candles,
+        built,
+        lead,
+        alongside,
+      );
+      return NextResponse.json({
+        ...built.history,
+        wallet,
+        // What was built by the time this returns, not what was there before:
+        // a window just built for a new token makes this "window", not null.
+        coverage: (await coverageOf(mint)) ?? "window",
+        candles: replay.candles,
+        trades: replay.trades,
+        points: replay.points,
+      });
+    }
+
+    const history = await reconstruct(mint, lead);
     if (!history) {
       return NextResponse.json(
         { error: "no trades found for this mint" },
         { status: 404 },
       );
     }
-    if (!wallet) return NextResponse.json(history);
-
-    // The wallet's own window replaces the token-wide one, so the replay opens
-    // on its trades rather than on the token's whole life.
-    const replay = replayFrom(mint, wallet, history.candles, lead, alongside);
-    return NextResponse.json({
-      ...history,
-      wallet,
-      candles: replay?.candles ?? history.candles,
-      trades: replay?.trades ?? [],
-      points: replay?.points ?? [],
-    });
+    return NextResponse.json({ ...history, coverage: "full" });
   } catch (error) {
+    /**
+     * Refused is not failed.
+     *
+     * A window too large to draw on demand is a complete, correct answer about
+     * what this endpoint will do — rendering it as a 500 would tell the visitor
+     * the app is broken when it is working exactly as intended.
+     */
+    /**
+     * Too expensive is not a failure, and it is not a dead end either.
+     *
+     * The pre-flight priced the window before spending anything, so this is
+     * the app declining knowingly rather than crashing into a limit. The token
+     * goes into the queue and the answer says how long — one build, however
+     * many people ask, because the queue dedups by mint.
+     */
+    if (error instanceof TooLarge) {
+      const { estimate } = error;
+      /**
+       * "This token needs indexing" is false when the token IS indexed.
+       *
+       * A fully indexed token has its whole life drawn at ONE bar width — the
+       * one that suits the token. A wallet replay picks its width from the
+       * WALLET's span instead, because a trader who was in for ten minutes is
+       * a single candle on a two-hour chart and no replay at all.
+       *
+       * It goes both ways: MEASURED on this token, the whole-life chart is at
+       * 7,200s and wallets off its own board have wanted 28,800s. Neither is
+       * "finer" — they are different questions about the same trades.
+       *
+       * So a wallet can need a rung that has never been built on a token that
+       * is otherwise complete, which is exactly what happens clicking a name
+       * off its own trader board — and being told the token is not indexed, on
+       * a page that only exists because it is, reads as a bug in the site.
+       */
+      const known = await coverageOf(mint);
+      const queued = await enqueue(mint, {
+        credits: estimate.credits,
+        seconds: estimate.seconds,
+        // The rung and span this click needed — the worker builds THAT, not
+        // the token's own whole-life width, which is usually a different key.
+        window: {
+          interval: estimate.interval,
+          from: estimate.from,
+          to: estimate.to,
+        },
+      });
+      return NextResponse.json(
+        {
+          error: !queued.accepted
+            ? "this needs building and the queue is full — try again shortly"
+            : known
+              ? "this wallet traded over a different span than the token's own " +
+                "chart covers, so its bars are being built now"
+              : "this token has not been indexed yet — it is queued now",
+          queued: queued.accepted,
+          status: queued.job.status,
+          ahead: queued.ahead,
+          /** Seconds to build it, once it starts. Not counting the wait. */
+          buildSeconds: estimate.seconds,
+        },
+        { status: 413 },
+      );
+    }
+
+    // Only reachable if the estimate was wrong; the ceiling is the backstop.
+    if (error instanceof BudgetExceeded) {
+      const queued = await enqueue(mint);
+      return NextResponse.json(
+        {
+          error:
+            "this wallet's window turned out larger than expected to draw — " +
+            "building it now",
+          queued: queued.accepted,
+          status: queued.job.status,
+          ahead: queued.ahead,
+        },
+        { status: 413 },
+      );
+    }
     return NextResponse.json(
       { error: (error as Error).message },
       { status: 500 },

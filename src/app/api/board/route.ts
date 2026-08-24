@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
-import { readOnly } from "@/server/config";
-import { indexed, traderBoard } from "@/server/history";
+import { owner } from "@/server/config";
+import { traderBoard } from "@/server/history";
 
 /**
  * Who made and lost the most on a token.
@@ -20,31 +20,32 @@ export const maxDuration = 300;
 export async function GET(request: Request) {
   const params = new URL(request.url).searchParams;
   const mint = params.get("mint")?.trim() ?? "";
-  // `update` reads every ranked wallet's transactions since the last build.
-  // Without it the stored books are simply re-marked at the current price.
-  // Re-reading every ranked wallet is the slow path, and the owner's to spend.
-  const update = params.get("update") === "1" && !readOnly();
   if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(mint)) {
     return NextResponse.json({ error: "a valid mint is required" }, { status: 400 });
   }
 
   /**
-   * A board for a token that is not on the site is a full build — a couple of
-   * hundred wallets read in full — so it is gated the same way the chart is.
-   * Without this a visitor could start one for any mint they liked simply by
-   * asking for its board instead of its chart.
+   * Building a board is the owner's to spend, and asking is not enough.
+   *
+   * This endpoint used to be gated on the mint being indexed, which stopped
+   * working the moment anything else could put a mint in the index: a chart
+   * built on the request path leaves a row behind, and the board for that row
+   * does not exist yet, so `traderBoard` would fall through to nomination and
+   * read a couple of hundred wallets in full for whoever asked second.
+   *
+   * `update` is the same hazard with a shorter fuse — it SKIPS the cached fast
+   * path outright, so it reaches the minutes-long branch however the build is
+   * gated. The two travel together: no permission to build, no update.
    */
-  if (readOnly() && !(await indexed(mint))) {
-    return NextResponse.json(
-      { error: "that token is not on this site yet" },
-      { status: 404 },
-    );
-  }
+  const mayBuild = owner(request);
 
   try {
-    const board = await traderBoard(mint, update);
+    const board = await traderBoard(mint, mayBuild && params.get("update") === "1", [], mayBuild);
     if (!board) {
-      return NextResponse.json({ error: "no trades found for this mint" }, { status: 404 });
+      return NextResponse.json(
+        { error: "the trader board for this token has not been worked out yet" },
+        { status: 404 },
+      );
     }
     return NextResponse.json(board);
   } catch (error) {

@@ -1,5 +1,6 @@
 import bs58 from "bs58";
 import { config } from "./config";
+import { take } from "./limit";
 import { normalizeTx, type NormalizedTx } from "./decode/normalizeTx";
 import {
   PositionBook,
@@ -17,8 +18,11 @@ import {
   type Swap,
 } from "./candles";
 import { densityMap } from "./density";
+import { estimateSeconds, estimateWindow } from "./estimate";
 import { walletGraph, type Related, type WalletGraph } from "./graph";
 import { identify, tokenIdentity } from "./identity";
+import { charge, checkBudget, metered, spentSoFar } from "./meter";
+import { recordSpend } from "./budget";
 import {
   accountKeys,
   pickVenue,
@@ -27,9 +31,14 @@ import {
   tradeFilter,
   type Venue,
 } from "./pool";
+import { QUOTE_MINTS, WSOL_MINT } from "./mints";
+import { isProgramDerived } from "./address";
 import {
-  builtTokens,
+  galleryTokens,
+  tokenRow,
   loadBlob,
+  loadBlobs,
+  saveBlobs,
   loadSeries,
   loadZoom,
   mergeCandles,
@@ -38,6 +47,7 @@ import {
   saveBlob,
   saveSeries,
   type BuiltToken,
+  type Coverage,
 } from "./store";
 
 /**
@@ -98,6 +108,47 @@ async function stage<T>(name: string, run: () => Promise<T>): Promise<T> {
     console.log(`[history] ${name} ${Date.now() - started}ms`);
   }
 }
+/**
+ * The same, for money.
+ *
+ * Reported unconditionally rather than behind HISTORY_DEBUG: what a request
+ * cost is the one number the daily ceiling and the per-class limits are set
+ * from, and it needs to be in the log of a deployment nobody is watching. The
+ * per-kind breakdown is what makes a total explicable — 36,000 credits reads
+ * as a mystery until it reads as 3,600 archive calls of two transactions each.
+ */
+async function priced<T>(
+  label: string,
+  run: () => Promise<T>,
+  ceiling?: number,
+): Promise<T> {
+  /**
+   * Reported and booked when the scope CLOSES, not when it returns.
+   *
+   * A build that spent forty thousand credits and then threw is the single
+   * most important thing a daily ceiling needs to know about, and reporting on
+   * the success path alone is how it would be the one thing never counted.
+   *
+   * Nested calls join the outer scope and settle nothing of their own, so a
+   * board that internally rebuilds a chart reports one number rather than two
+   * that have to be added up.
+   */
+  const { result } = await metered(
+    label,
+    run,
+    (spend) => {
+      void recordSpend(spend.credits);
+      const kinds = Object.entries(spend.byKind)
+        .map(([kind, k]) => `${kind} ${k.calls}×${k.credits}`)
+        .join(", ");
+      console.log(
+        `[credits] ${label} ${spend.credits} credits over ${spend.calls} calls (${kinds})`,
+      );
+    },
+    ceiling,
+  );
+  return result;
+}
 const PAGE = 1_000;
 
 /**
@@ -152,6 +203,12 @@ export interface HistoryFill {
   priceUsd: number;
   /** "transfer" when tokens moved with no money against them. */
   kind?: "swap" | "transfer";
+  /**
+   * True when `priceUsd` is this fill's own execution price rather than the
+   * chart's bar close. Reported per build so a board can say how much of it
+   * was measured and how much was approximated.
+   */
+  exact?: boolean;
 }
 
 export interface TokenHistory {
@@ -182,6 +239,15 @@ export interface TokenHistory {
   exact?: boolean;
   /** True when the named wallet has more history than was read. */
   partial?: boolean;
+  /**
+   * How much of the token this chart covers.
+   *
+   * On the wire because the client has to decide whether to ask for a trader
+   * board at all — and a `window` chart has none, by construction. Without it
+   * the page asks anyway, gets a 404, and renders two empty panels promising
+   * rankings that were never going to exist.
+   */
+  coverage?: Coverage;
   /**
    * The stretch of this chart drawn at a finer bar width, when one was asked
    * for. Bars inside it are `zoom.interval` wide and the rest are `interval`,
@@ -245,7 +311,16 @@ interface BoardState {
    * — paying it on every board read would have made re-marking, which is
    * otherwise 0.4 seconds, the slowest thing on the page.
    */
-  names?: Record<string, { name?: string; category?: string }>;
+  names?: Record<string, { name?: string; category?: string; type?: string }>;
+  /**
+   * Which vintage of `names` this is.
+   *
+   * A wallet recorded here is never asked about again — "Helius had no name"
+   * is stored as `{}` and that answer is permanent, not one that ages out. So
+   * when the lookup learns to name more wallets, the boards already built are
+   * exactly the ones that would never find out. Bumping this re-asks once.
+   */
+  namesV?: number;
 }
 
 /**
@@ -277,6 +352,7 @@ async function archive(
   transactionDetails: "full" | "signatures" = "full",
 ): Promise<{ data: unknown[]; paginationToken?: string } | null> {
   try {
+    await take();
     const res = await fetch(config.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -301,7 +377,16 @@ async function archive(
     });
     if (!res.ok) return null;
     const body = (await res.json()) as { result?: { data: unknown[]; paginationToken?: string } };
-    return body.result ?? null;
+    const result = body.result ?? null;
+    // Charged on what came BACK, because that is how the endpoint bills: a
+    // signatures page is flat, and a full page is per hundred rows returned.
+    // A failed response is free, so nothing is charged above.
+    charge(
+      transactionDetails === "signatures"
+        ? { kind: "signatures" }
+        : { kind: "archive", returned: result?.data?.length ?? 0 },
+    );
+    return result;
   } catch {
     return null;
   }
@@ -388,21 +473,47 @@ function adapt(raw: unknown): NormalizedTx | null {
  * `getMultipleAccounts` over the handful of counterparties a wallet ever has
  * answers it: a person's account is System-owned, a vault's is not.
  *
- * The PRICE is the token's market price at that moment rather than the SOL
- * that moved, for the same reason the first test failed — the payer is often
- * not the holder. It loses slippage within a bar, which is a rounding error
- * next to calling a wallet's position an airdrop.
+ * The PRICE comes from the COUNTERPARTY POOL's quote leg in the same
+ * transaction — see `execPrice`. Not from the wallet's own SOL delta, for the
+ * reason the first test above failed: the payer is often not the holder. And
+ * not from the chart, which was the old answer and the single biggest source
+ * of wrong PnL in this app.
+ *
+ * MEASURED, and this is why it matters: the board prices fills from a series
+ * built at `pickInterval(life)`, which for a token a year old is a bar 2.67
+ * DAYS wide — 21.3 days at the widest. `priceLookup` returns that bar's close
+ * for every fill inside it. MELANIA's first bar spans $3.85 to $12.21 and
+ * closes at $4.3833, so every trade of its entire launch — where all of the
+ * money was made and lost — was booked at one price, and four of the five
+ * largest traders came out at EXACTLY $0 with avgBuy equal to avgSell.
+ *
+ * The pool's own quote delta is the real execution price, slippage included,
+ * and it is already sitting in the transaction we fetched. It costs nothing.
+ * The chart price stays as the fallback for a fill whose quote leg cannot be
+ * resolved, which is where this used to start.
  */
 async function walletFills(
   txs: NormalizedTx[],
   mint: string,
   wallet: string,
   priceAt: (ts: number) => number,
+  sol: SolPriceHistory,
 ): Promise<HistoryFill[]> {
   interface Move {
     ts: number;
     base: number;
     counterparties: string[];
+    /** Execution price from the pool's quote leg, or 0 when unresolvable. */
+    exec: number;
+    /**
+     * Whether ANY money moved in the transaction, however it was routed.
+     *
+     * Weaker than `exec` and deliberately so: it is what separates "a real
+     * swap whose quote leg we could not attribute" — which still deserves the
+     * chart's price — from "no money changed hands here at all", which is a
+     * transfer whatever program carried it.
+     */
+    quoteMoved: boolean;
   }
 
   const moves: Move[] = [];
@@ -442,6 +553,18 @@ async function walletFills(
     // Whoever moved the mint the other way. A buy's counterparty gave tokens
     // up; a sell's took them on.
     const counterparties: string[] = [];
+    /**
+     * How much of the mint the POOLS moved, which is the denominator the
+     * execution price needs — not this wallet's share of it.
+     *
+     * MEASURED, and this is the whole reason it is tracked separately:
+     * `8WiUx5Ah` takes 0.02 to 1.4 TRUMP out of transactions whose pool leg is
+     * thousands of dollars, because the transaction carries a far larger trade
+     * than this wallet's cut of it. Dividing the pool's quote movement by the
+     * WALLET's base priced 1,739 of its 1,795 fills over $1,000 a token, on a
+     * token that peaked near $75, and put it on the board at -$14.9m.
+     */
+    let poolBase = 0;
     for (const after of tx.postTokenBalances) {
       if (after.mint !== mint || after.owner === wallet || !after.owner) continue;
       const before = tx.preTokenBalances.find(
@@ -449,32 +572,199 @@ async function walletFills(
       );
       const delta = after.amountRaw - (before?.amountRaw ?? 0n);
       if (delta === 0n) continue;
-      if (base > 0 ? delta < 0n : delta > 0n) counterparties.push(after.owner);
+      if (base > 0 ? delta < 0n : delta > 0n) {
+        counterparties.push(after.owner);
+        if (isProgramDerived(after.owner)) {
+          poolBase += Number(delta) / 10 ** after.decimals;
+        }
+      }
     }
-    moves.push({ ts, base, counterparties });
+    // Scoped to the pools that took the other side of THIS mint, so a routed
+    // swap's later hops — which never touch the mint — cannot be read as part
+    // of what was paid for it.
+    const books = programOwned(counterparties);
+    moves.push({
+      ts,
+      base,
+      counterparties,
+      exec:
+        books.size > 0 && poolBase !== 0 ? execPrice(tx, poolBase, books, sol) : 0,
+      quoteMoved: quoteMoved(tx),
+    });
   }
 
   const pools = programOwned(moves.flatMap((m) => m.counterparties));
 
   const fills: HistoryFill[] = [];
   for (const move of moves) {
-    const traded = move.counterparties.some((owner) => pools.has(owner));
-    const price = priceAt(move.ts);
+    /**
+     * A pool on the other side is NOT enough. Money has to have moved.
+     *
+     * `isProgramDerived` says "not a person", which is true of a pool and
+     * equally true of a Squads multisig, a Meteora DLMM position, an escrow
+     * and a vesting contract. Treating all of them as trades, and then pricing
+     * the ones with no quote leg off the chart, invents money that never
+     * changed hands.
+     *
+     * MEASURED on TRUMP's top-ranked wallet, `2Fe47zbh`: 67 of its 68 "swaps"
+     * had no quote leg at all. Two of them were 25,000,000 and 27,000,000
+     * tokens arriving from a Squads multisig — round numbers, a treasury
+     * distribution — and the chart priced them at $17.67 for $919m of
+     * fabricated buying. The rest were liquidity going into a DLMM position,
+     * booked as sales. The wallet had never traded, and it was first on the
+     * board at +$66m.
+     */
+    const traded =
+      move.counterparties.some((owner) => pools.has(owner)) &&
+      (move.exec > 0 || move.quoteMoved);
+    // The fill's own execution price where the quote leg resolved, and the
+    // chart's bar close only where money demonstrably moved but could not be
+    // attributed to the pool.
+    const price = move.exec > 0 ? move.exec : priceAt(move.ts);
     const baseAbs = Math.abs(move.base);
+    /**
+     * Transfers carry a MARK as well, which they did not used to.
+     *
+     * Tokens leaving the wallet are booked as an exit at the prevailing price
+     * — see the transfer branch of `PositionBook.apply`. That needs a price,
+     * and the chart is the only one available, because a transfer has no quote
+     * leg by construction.
+     *
+     * Tokens arriving still create no basis: `apply` ignores this figure on
+     * the way in, deliberately, so that being handed tokens can never look
+     * like having bought them.
+     */
     fills.push({
       ts: move.ts,
       venue: traded ? "pool" : "transfer",
       wallet,
       isBuy: move.base > 0,
       base: baseAbs,
-      usd: traded ? baseAbs * price : 0,
-      priceUsd: traded ? price : 0,
+      usd: baseAbs * price,
+      priceUsd: price,
       kind: traded ? "swap" : "transfer",
+      exact: move.exec > 0,
     });
   }
 
   fills.sort((a, b) => a.ts - b.ts);
   return fills;
+}
+
+/**
+ * Whether any quote asset changed hands anywhere in this transaction.
+ *
+ * Scoped to the whole transaction rather than to the pools, because that is
+ * the question: a swap routed somewhere we did not resolve still moved SOL or
+ * a stablecoin SOMEWHERE, and a treasury distribution or a liquidity deposit
+ * moves none at all. Native lamports count — a bonding curve's quote leg is
+ * never a token balance — but only where they move by more than a transaction
+ * fee, since every signer's lamports change on every transaction.
+ */
+const MAX_FEE_LAMPORTS = 100_000_000;
+
+function quoteMoved(tx: NormalizedTx): boolean {
+  for (const after of tx.postTokenBalances) {
+    if (!QUOTE_MINTS.has(after.mint)) continue;
+    const before = tx.preTokenBalances.find(
+      (b) => b.accountIndex === after.accountIndex,
+    );
+    if (after.amountRaw !== (before?.amountRaw ?? 0n)) return true;
+  }
+  for (const before of tx.preTokenBalances) {
+    if (!QUOTE_MINTS.has(before.mint)) continue;
+    const survives = tx.postTokenBalances.some(
+      (a) => a.accountIndex === before.accountIndex,
+    );
+    if (!survives && before.amountRaw !== 0n) return true;
+  }
+  for (let i = 0; i < tx.preBalances.length; i += 1) {
+    const delta = (tx.postBalances[i] ?? 0n) - (tx.preBalances[i] ?? 0n);
+    const size = delta < 0n ? -delta : delta;
+    if (size > BigInt(MAX_FEE_LAMPORTS)) return true;
+  }
+  return false;
+}
+
+/**
+ * What the pool actually paid or received, in dollars, for this fill.
+ *
+ * `priceSwap` answers the same question for the CHART, and cannot be reused
+ * here: it is pinned to one venue's resolved `baseVault`/`quoteVault`, and a
+ * wallet trades wherever it likes. This works from ownership instead, so it
+ * prices a fill on a pool nothing has ever discovered.
+ *
+ * Only the pools that moved THIS mint are looked at, which is what keeps a
+ * multi-hop route honest: a TRUMP→SOL→USDC swap has a second pool trading SOL
+ * for USDC, and counting its leg would double the money attributed to the
+ * TRUMP trade. That pool holds no TRUMP, so it is not in `books`.
+ *
+ * Returns 0 rather than guessing. The caller falls back to the chart, so an
+ * unresolvable fill is priced no worse than it was before this existed.
+ */
+function execPrice(
+  tx: NormalizedTx,
+  /** The POOLS' own base movement, not the wallet's. See `poolBase`. */
+  poolBase: number,
+  books: Set<string>,
+  sol: SolPriceHistory,
+): number {
+  const ts = tx.blockTime ?? 0;
+  if (ts <= 0) return 0;
+  const solUsd = sol.at(ts);
+  let quoteUsd = 0;
+
+  const rate = (quoteMint: string): number =>
+    quoteMint === WSOL_MINT ? solUsd : QUOTE_MINTS.has(quoteMint) ? 1 : 0;
+
+  for (const after of tx.postTokenBalances) {
+    if (!books.has(after.owner) || !QUOTE_MINTS.has(after.mint)) continue;
+    const before = tx.preTokenBalances.find(
+      (b) => b.accountIndex === after.accountIndex,
+    );
+    const delta =
+      Number(after.amountRaw - (before?.amountRaw ?? 0n)) / 10 ** after.decimals;
+    quoteUsd += delta * rate(after.mint);
+  }
+  /**
+   * A vault emptied and closed in the same transaction has no post balance, so
+   * the loop above cannot see the money leave. Same shape as the base leg's
+   * closed-account case, and the same consequence if it is missed: the sell
+   * that took the wallet out prices at nothing.
+   */
+  for (const before of tx.preTokenBalances) {
+    if (!books.has(before.owner) || !QUOTE_MINTS.has(before.mint)) continue;
+    const survives = tx.postTokenBalances.some(
+      (a) => a.accountIndex === before.accountIndex,
+    );
+    if (survives) continue;
+    quoteUsd -= (Number(before.amountRaw) / 10 ** before.decimals) * rate(before.mint);
+  }
+
+  /**
+   * A bonding curve holds lamports on the pool account itself rather than in a
+   * wrapped-SOL account, so its quote leg is not a token balance at all. This
+   * is every pump.fun token before it graduates.
+   */
+  if (quoteUsd === 0 && solUsd > 0) {
+    for (const book of books) {
+      const i = tx.accountKeys.indexOf(book);
+      if (i < 0) continue;
+      const delta =
+        Number((tx.postBalances[i] ?? 0n) - (tx.preBalances[i] ?? 0n)) / 1e9;
+      quoteUsd += delta * solUsd;
+    }
+  }
+
+  if (quoteUsd === 0) return 0;
+  /**
+   * A pool's two legs must move OPPOSITE ways: it gives up the token and takes
+   * in the quote, or the reverse. Both moving the same way is a liquidity
+   * deposit or withdrawal, which has no execution price and must not be booked
+   * as one.
+   */
+  if (Math.sign(quoteUsd) === Math.sign(poolBase)) return 0;
+  return Math.abs(quoteUsd) / Math.abs(poolBase);
 }
 
 /**
@@ -576,6 +866,15 @@ async function walletActivity(
   wallet: string,
   /** Only transactions at or after this time. Used to update a stored book. */
   since = 0,
+  /**
+   * Pages of full transactions this read may spend.
+   *
+   * Lower for a visitor than for the owner. Twelve pages is twelve thousand
+   * transactions and some sixty megabytes, which is fine for a machine
+   * indexing one token on purpose and is not something an anonymous request
+   * should be able to ask for repeatedly.
+   */
+  maxPages = WALLET_PAGES,
 ): Promise<{
   txs: NormalizedTx[];
   first: number;
@@ -587,7 +886,7 @@ async function walletActivity(
   const txs: NormalizedTx[] = [];
   let token: string | undefined;
 
-  for (let page = 0; page < WALLET_PAGES; page += 1) {
+  for (let page = 0; page < maxPages; page += 1) {
     /**
      * Asked for by mint, not filtered afterwards.
      *
@@ -642,6 +941,7 @@ async function tokenSupply(mint: string): Promise<number> {
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T | null> {
   try {
+    await take();
     const res = await fetch(config.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -650,6 +950,7 @@ async function rpc<T>(method: string, params: unknown[]): Promise<T | null> {
     });
     if (!res.ok) return null;
     const body = (await res.json()) as { result?: T };
+    charge({ kind: "rpc" });
     return body.result ?? null;
   } catch {
     return null;
@@ -707,26 +1008,6 @@ async function poolLifespan(
 }
 
 /**
- * The close of the latest bar before `t`, across every list that might hold it.
- *
- * Two lists because a build knows its bars from two places — the ones already
- * cached and the ones it has produced for earlier gaps in this same call — and
- * the bar immediately before a gap can be in either.
- */
-function closeBefore(t: number, ...lists: Candle[][]): number {
-  let best: Candle | null = null;
-  for (const bars of lists) {
-    for (let i = bars.length - 1; i >= 0; i -= 1) {
-      const c = bars[i] as Candle;
-      if (c.t >= t) continue;
-      if (!best || c.t > best.t) best = c;
-      break;
-    }
-  }
-  return best?.c ?? 0;
-}
-
-/**
  * Candles for a window, served from the cache wherever it can be.
  *
  * A token's past does not move. Only the newest bar can still change — it was
@@ -760,11 +1041,13 @@ async function series(
     console.log(`[history] gaps ${gaps.length} covering ${bars} of ${span} bars`);
   }
 
-  let exact = true;
+  let exact = cached?.exact ?? true;
+  let stored: Candle[] = cached?.candles ?? [];
   const fresh: Candle[] = [];
   /** Bars to return but not store, when a window could not be read whole. */
   let drew: Candle[] = [];
   for (const gap of gaps) {
+    checkBudget();
     /**
      * A density map for the gap, sized to the gap.
      *
@@ -789,7 +1072,8 @@ async function series(
      * five contiguous days of one-minute bars came back as six ranges split by
      * single quiet minutes.
      */
-    const seed = closeBefore(gap.from, cached?.candles ?? [], fresh);
+    const seed =
+      [...stored].reverse().find((c) => c.t < gap.from)?.c ?? 0;
     const built = await buildCandles(
       venue,
       mint,
@@ -810,18 +1094,31 @@ async function series(
      * `missingRanges` sees a gap next time and tries again.
      */
     const unresolved = new Set(built.suspect);
-    fresh.push(...built.candles.filter((c) => !unresolved.has(c.t)));
+    const keep = built.candles.filter((c) => !unresolved.has(c.t));
+    fresh.push(...keep);
     if (unresolved.size > 0) drew = built.candles;
+
+    /**
+     * Saved per GAP, not once at the end.
+     *
+     * A build that is abandoned part-way — the tab closed, the function timed
+     * out — used to throw away every bar it had already paid for, and the next
+     * attempt read all of them again. The gaps are independent and each one is
+     * a complete, correct set of bars the moment it lands, so there is nothing
+     * to be gained by holding them.
+     *
+     * `exact` stays conservative and only ever moves downward: one sampled
+     * range makes the whole stored series sampled until it is rebuilt. So a
+     * partial save carries the honest value for the bars actually written, and
+     * a later gap can only lower it.
+     */
+    if (keep.length > 0) {
+      stored = mergeCandles(stored, keep);
+      await saveSeries({ mint, interval, venue, candles: stored, exact, builtAt: nowSec() });
+    }
   }
 
-  // Exact only if the cache was and this build was. One sampled range makes
-  // the whole stored series sampled until it is rebuilt, which is the
-  // conservative direction to be wrong in.
-  exact = exact && (cached?.exact ?? true);
   const merged = mergeCandles(cached?.candles ?? [], fresh);
-  if (fresh.length > 0) {
-    await saveSeries({ mint, interval, venue, candles: merged, exact, builtAt: nowSec() });
-  }
 
   const start = Math.floor(from / interval) * interval;
   // Anything unresolved is shown from this build even though it was not kept.
@@ -1117,7 +1414,7 @@ async function nominate(
 /**
  * Bars a spliced section may hold. A backstop, not the real bound.
  *
- * The real bound is that a section is only offered over a stretch already
+ * The real bound is that a section is only offered over the stretch already
  * built at the fine width — see `zoomable` — so the series call behind it is a
  * cache read. This catches the case where that stretch is itself enormous:
  * `buildCandles` holds every response of a sweep at once, and a few thousand
@@ -1125,17 +1422,11 @@ async function nominate(
  */
 const ZOOM_MAX_BARS = Number(process.env.ZOOM_MAX_BARS ?? 4_000);
 
-/** A stretch of the chart drawn at the finer width. Snapped by the caller. */
-export interface ZoomSection {
-  from: number;
-  to: number;
-}
-
 /**
  * Whether this token has bars finer than its own chart, and how fine.
  *
- * Read from the index a build leaves behind rather than from configuration: a
- * token is zoomable exactly when someone has run `scripts/zoom-window.mjs`
+ * Read from the index a build leaves behind rather than from configuration:
+ * a token is zoomable exactly when someone has run `scripts/zoom-window.mjs`
  * over it, and there is nothing to switch on. That is also what bounds the
  * cost — the section a caller may ask for is a slice of what is already
  * stored, so it is a cache read however hard the slider is dragged.
@@ -1150,9 +1441,9 @@ async function zoomFor(
   /**
    * The range that overlaps this replay most, not merely the first one.
    *
-   * A token built over two stretches has one that matters to any given wallet
-   * — usually the only one it traded in. Ties go to the later range, which is
-   * the one a fresh replay is more likely to be about.
+   * A token built over two stretches has one that matters to any given
+   * wallet — usually the only one it traded in. Ties go to the later range,
+   * which is the one a fresh replay is more likely to be about.
    */
   let best: { from: number; to: number; overlap: number } | null = null;
   for (const r of index.ranges ?? []) {
@@ -1161,6 +1452,12 @@ async function zoomFor(
     if (!best || overlap >= best.overlap) best = { ...r, overlap };
   }
   return best ? { interval: index.interval, from: best.from, to: best.to } : null;
+}
+
+/** A stretch of the chart drawn at the finer width. Snapped by the caller. */
+export interface ZoomSection {
+  from: number;
+  to: number;
 }
 
 async function walletHistory(
@@ -1177,12 +1474,13 @@ async function walletHistory(
    * other, so as one position it cancels exactly, the way it should.
    */
   alongside: string[] = [],
+  limits: ReplayLimits = OWNER_LIMITS,
   /** The stretch to draw finely, when the caller picked one. See `zoomFor`. */
   section?: ZoomSection,
-): Promise<TokenHistory | null> {
+): Promise<WalletReplay | null> {
   const cluster = [wallet, ...alongside.filter((w) => w !== wallet)];
   const [activities, venue] = await Promise.all([
-    Promise.all(cluster.map((w) => walletActivity(mint, w))),
+    Promise.all(cluster.map((w) => walletActivity(mint, w, 0, limits.pages))),
     venueFor(mint),
   ]);
   const activity = activities[0] as (typeof activities)[number];
@@ -1200,11 +1498,71 @@ async function walletHistory(
    * readable length either side, so a replay always opens on the token in
    * motion and carries on past the last trade to show how it played out.
    */
-  const traded = Math.max(lastTs - firstTs, 0);
-  const interval = pickInterval(traded + leadSec);
-  const pad = interval * MIN_CANDLES;
-  const from = firstTs - Math.max(leadSec, pad / 2);
-  const to = Math.min(lastTs + Math.max(interval, pad / 2), nowSec());
+  const { interval, from, to } = replayWindow(firstTs, lastTs, leadSec);
+
+  /**
+   * Refuse a window too large to draw on demand — do not quietly narrow it.
+   *
+   * Counted as bars MISSING from the cache rather than bars in the window, so
+   * an already-indexed token costs nothing here: `missingRanges` returns one
+   * or two, and this never fires. It fires on a cold mint where the wallet
+   * held across a long span, which is precisely the request that would
+   * otherwise draw hundreds of sampled bars for one anonymous visitor.
+   *
+   * Refusing rather than trimming is deliberate. A narrowed window would price
+   * the wallet's entry against bars that were never read, and a confidently
+   * wrong PnL is worse than an honest no — the same reason `exactBoard` drops
+   * a wallet it could not read whole instead of ranking it on part of one.
+   */
+  /**
+   * Price the window before drawing any of it.
+   *
+   * This replaces attempting the build and letting the credit ceiling stop it
+   * part-way, which was the worst of both: MEASURED, 4,342 credits spent to
+   * learn one fact, and nothing kept — the window is a single gap and gaps are
+   * only stored once they complete, so four clicks in a row bought four
+   * identical nothings.
+   *
+   * Counting signatures answers the same question for a fortieth of that, and
+   * answers it BEFORE the money is gone, which is what lets the caller say
+   * "this needs indexing first" instead of "something went wrong".
+   */
+  const bounded = Number.isFinite(limits.credits);
+  if (bounded) {
+    const cached = await loadSeries(mint, interval);
+    const missing = missingRanges(cached, from, to, interval).reduce(
+      (n, gap) => n + Math.ceil((gap.to - gap.from) / interval),
+      0,
+    );
+    if (missing > limits.buildBars) {
+      throw new TooLarge(`this window needs ${missing} bars built`, {
+        bars: missing,
+        credits: missing * 170,
+        seconds: Math.round(missing * 0.048),
+        interval,
+        from,
+        to,
+      });
+    }
+    if (missing > 0) {
+      const cost = await stage("estimate", () =>
+        estimateWindow(venue, mint, from, to, interval, missing),
+      );
+      if (cost.credits > limits.credits) {
+        throw new TooLarge(
+          `drawing this window would cost about ${cost.credits} credits`,
+          {
+            bars: cost.bars,
+            credits: cost.credits,
+            seconds: estimateSeconds(cost),
+            interval,
+            from,
+            to,
+          },
+        );
+      }
+    }
+  }
 
   const sol = new SolPriceHistory();
   await sol.load(from, to);
@@ -1233,25 +1591,26 @@ async function walletHistory(
    * One stretch of the chart at a finer bar width, spliced into the coarse one.
    *
    * Not a second chart and not a zoom of the first: the bars either side stay
-   * as wide as they were and the ones inside the section are minutes, in a
-   * single series that runs straight through. The replay steps one bar at a
-   * time, so the section plays out slowly while the rest of the token's life
-   * goes past at its usual width — which is the point, since a minute that
-   * moved 45% is one flat-looking bar on a two-hour chart.
+   * two hours wide and the ones inside the section are minutes, in a single
+   * series that runs straight through. The replay steps one bar at a time, so
+   * the section plays out slowly while the rest of the token's life goes past
+   * at the width it was always drawn at — which is the point, since a minute
+   * that moved 45% is one flat-looking bar on a two-hour chart.
    *
-   * Offered ONLY over a stretch already built at the fine width. That is what
-   * keeps this from being a way to spend money by dragging a slider: the
-   * `series` call below is a cache read, not a build.
+   * Offered ONLY over the stretch already built at the fine width. That is
+   * what keeps this from being a way to spend money by dragging a slider: the
+   * `series` call below is a cache read, not a build. Anything else is a run
+   * of `scripts/zoom-window.mjs` away.
    */
   const fine = await zoomFor(mint, { from, to });
   /**
    * The stretch a section may be cut from, in COARSE bars.
    *
    * Snapped INWARD, which is the direction that matters: the edges of a
-   * section are filled from fine bars either side of it, so the usable range
-   * has to be one where the whole coarse bar containing each edge is itself
-   * covered at the fine width. Snapping outward would reach for minute bars
-   * that were never built and turn a slider drag into a build.
+   * section are filled from fine bars either side of it (see below), so the
+   * usable range has to be one where the whole coarse bar containing each edge
+   * is itself covered at the fine width. Snapping outward would reach for
+   * minute bars that were never built and turn a slider drag into a build.
    */
   const covered = fine
     ? {
@@ -1275,8 +1634,8 @@ async function walletHistory(
      * again, and a bar drawn twice is volume counted twice — and it cannot
      * simply go either, because dropping it leaves 02:00 to 02:37 with no bar
      * at all. So it is REBUILT from the fine bars of just that stub, and the
-     * same at the far end. That is what lets a section begin and end on a
-     * minute instead of being widened to the nearest coarse boundary.
+     * same at the far end. That is what lets the section begin and end on a
+     * minute instead of being widened to the nearest two hours.
      */
     const head = Math.floor(zf / interval) * interval;
     const tail = Math.ceil(zt / interval) * interval;
@@ -1312,23 +1671,11 @@ async function walletHistory(
         mint,
         w,
         priceAt,
+        sol,
       ),
     ),
   );
   const fills = perWallet.flat().sort((a, b) => a.ts - b.ts);
-
-  const book = new PositionBook(Number.POSITIVE_INFINITY);
-  for (const f of fills) {
-    // Every fill under the SUBJECT's identity: the cluster is one position.
-    book.apply(mint, wallet, {
-      ts: f.ts,
-      isBuy: f.isBuy,
-      base: f.base,
-      usd: f.usd,
-      kind: f.kind,
-    });
-  }
-  histories.set(clusterKey(mint, cluster), { book, fills, interval });
 
   /**
    * Three lookups that need nothing from each other, awaited together.
@@ -1343,11 +1690,9 @@ async function walletHistory(
     tokenSupply(mint),
   ]);
 
-  // The COARSE series is what the token is remembered by; the spliced one is
-  // this request's view of it.
-  await remember(mint, interval, drawn.candles, token);
+  await remember(mint, interval, drawn.candles, "window", token);
 
-  return {
+  const history: TokenHistory = {
     mint,
     cluster: cluster.length > 1 ? cluster : undefined,
     walletName,
@@ -1356,6 +1701,20 @@ async function walletHistory(
     supply,
     interval,
     fills: fills.length,
+    /**
+     * Swaps in THIS WINDOW, not over the token's life.
+     *
+     * It was simply absent, and the page renders a missing count as zero — so
+     * a replay built from a hundred and forty-four bars of real trading
+     * reported "Swaps 0", which reads as a broken number rather than a missing
+     * one. The lifetime figure comes from the whole-life density map, and a
+     * wallet replay never builds one: it draws a window, so the honest count
+     * is what that window holds.
+     *
+     * On a sampled window this is what was READ rather than what happened —
+     * which is why the panel shows "sampled" beside it.
+     */
+    swaps: candles.reduce((n, c) => n + c.n, 0),
     transactions: activities.reduce((n, a) => n + a.txs.length, 0),
     firstTs: candles[0]?.t ?? activity.first,
     lastTs: candles[candles.length - 1]?.t ?? activity.last,
@@ -1365,15 +1724,15 @@ async function walletHistory(
     zoom: zoomed,
     /**
      * The stretch a section may be picked from, which is what the control
-     * under the chart is drawn against. Absent means nothing has been built at
-     * a finer width for this mint — so there is nothing to offer, and no
-     * control to show.
+     * under the chart is drawn against. Absent means the feature is off for
+     * this pair, or nothing has been built at the fine width yet — either way
+     * there is nothing to offer and no control to show.
      */
-    zoomable:
-      covered && covered.to > covered.from
-        ? { interval: (fine as { interval: number }).interval, ...covered }
-        : undefined,
+    zoomable: covered && covered.to > covered.from
+      ? { interval: (fine as { interval: number }).interval, ...covered }
+      : undefined,
   };
+  return { history, fills, interval };
 }
 
 /**
@@ -1387,11 +1746,21 @@ async function remember(
   mint: string,
   interval: number,
   candles: Candle[],
+  /**
+   * Whether these candles are the token's whole life or one wallet's slice.
+   *
+   * Required rather than defaulted, because the two callers that produce
+   * `window` and the two that produce `full` look identical from here, and
+   * guessing wrong in either direction is a visible bug: a slice in the
+   * gallery, or a whole-life chart hidden from it.
+   */
+  coverage: Coverage,
   extra: Partial<BuiltToken> = {},
 ): Promise<void> {
   if (candles.length === 0) return;
   await rememberToken({
     mint,
+    coverage,
     interval,
     bars: candles.length,
     firstTs: candles[0]?.t ?? 0,
@@ -1401,9 +1770,43 @@ async function remember(
   });
 }
 
-/** Rebuilt histories, so asking about a second wallet costs nothing. */
-const cache = new Map<string, { at: number; history: TokenHistory }>();
+/**
+ * Rebuilt charts, and the builds still running.
+ *
+ * The promise is stored BEFORE the work starts, not the result after it. The
+ * old shape only wrote on success at the end, so two requests for the same
+ * cold mint both missed, both ran the whole reconstruction, and paid for it
+ * twice — the window where that happens is precisely the minute the build is
+ * expensive.
+ *
+ * Bounded, because it never was. An unbounded map of every mint an instance
+ * has ever drawn is a leak that grows with traffic.
+ */
+const cache = new Map<string, { at: number; history: Promise<TokenHistory | null> }>();
 const CACHE_MS = Number(process.env.HISTORY_CACHE_MS ?? 10 * 60_000);
+const CACHE_MAX = Number(process.env.HISTORY_CACHE_MAX ?? 200);
+
+/**
+ * Wallet replays in flight. Shared, never kept.
+ *
+ * Two people opening the same wallet at once should cost one read; the same
+ * person opening it a minute later should get fresh numbers. A wallet replay
+ * is cheap on an indexed token and its whole value is being current — the
+ * chart path bypassed this cache entirely for exactly that reason — so these
+ * entries are deleted the moment they settle, success or failure.
+ */
+const walletsInFlight = new Map<string, Promise<WalletReplay | null>>();
+
+function remember_<T>(map: Map<string, T>, key: string, value: T, max: number): void {
+  map.delete(key);
+  map.set(key, value);
+  // Insertion-ordered, so the first key is the least recently written.
+  while (map.size > max) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
 
 /** Traders read exactly for the board. Two calls each, run in parallel. */
 const BOARD_CANDIDATES = Number(process.env.HISTORY_BOARD_CANDIDATES ?? 220);
@@ -1412,6 +1815,15 @@ const GRAPH_READ_LIMIT = Number(process.env.HISTORY_GRAPH_READ ?? 8);
 
 /** Rows kept per side. The page scrolls, so this is what "many more" costs. */
 const BOARD_ROWS = Number(process.env.HISTORY_BOARD_ROWS ?? 60);
+
+/** Bumped when `identify` learns to name wallets it used to call unknown. */
+/**
+ * Bumped to 3 when `type` joined the stored identity.
+ *
+ * A board cached under v2 holds names with no `type`, so the protocol test
+ * would silently never fire on exactly the wallets it exists to catch.
+ */
+const NAMES_V = 3;
 
 /**
  * An honest trader board on a token too busy to read whole.
@@ -1473,6 +1885,7 @@ async function exactBoard(
   mint: string,
   candidates: string[],
   priceAt: (ts: number) => number,
+  sol: SolPriceHistory,
   /** Seeded book and cutoff, when updating rather than building. */
   carry?: { book: PositionBook; since: number },
 ): Promise<{ book: PositionBook; fills: HistoryFill[] }> {
@@ -1520,7 +1933,7 @@ async function exactBoard(
           // Better absent than fabricated: a wallet whose sells were read and
           // whose buys were not ranks as a winner that never existed.
           if (activity.truncated) return [];
-          return await walletFills(activity.txs, mint, w, priceAt);
+          return await walletFills(activity.txs, mint, w, priceAt, sol);
         } catch {
           return [];
         }
@@ -1546,33 +1959,421 @@ async function exactBoard(
 
 export async function reconstruct(
   mint: string,
-  /** When set, that wallet's own trades are read exactly, whatever the token's size. */
-  wallet?: string,
   leadSec = 300,
-  /** Extra wallets replayed as one position with it. See `walletHistory`. */
-  alongside: string[] = [],
-  /** The stretch to draw at the finer bar width. See `zoomFor`. */
-  section?: ZoomSection,
 ): Promise<TokenHistory | null> {
-  /**
-   * A token is rebuilt ONCE. Replaying a second wallet on it then costs only
-   * that wallet's own history — a call or two — rather than the whole token
-   * again, which is what makes "let me look at all the holders" usable.
-   */
   const hit = cache.get(mint);
-  if (hit && Date.now() - hit.at < CACHE_MS && !wallet) return hit.history;
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.history;
 
   /**
-   * With a wallet named, take the fast road.
-   *
-   * Its trades come from its own history — a call or two, exact, whatever the
-   * token's size — and the chart is drawn only for the window they span.
+   * Published before it is awaited, so a second caller joins instead of
+   * starting its own. This is the whole of the coalescing: no table, no lock,
+   * no waiter protocol — just not throwing away the fact that the work is
+   * already happening.
    */
-  if (wallet) {
-    const quick = await walletHistory(mint, wallet, leadSec, alongside, section);
-    if (quick) return quick;
+  const pending = priced(`history ${mint}`, () => reconstructInner(mint, leadSec));
+  remember_(cache, mint, { at: Date.now(), history: pending }, CACHE_MAX);
+
+  try {
+    const built = await pending;
+    /**
+     * A null is not an answer worth keeping.
+     *
+     * `reconstructInner` returns null when the venue or the lifespan could not
+     * be read, and either can be a one-off upstream failure. Memoising that
+     * would turn a blip into ten minutes of a token that "has no trades".
+     */
+    if (built === null) cache.delete(mint);
+    return built;
+  } catch (error) {
+    cache.delete(mint);
+    throw error;
+  }
+}
+
+/**
+ * Transactions read to decide whether a wallet ever TRADED a mint.
+ *
+ * Small on purpose. The question is "any swap at all", not "how many", and a
+ * page of a thousand full transactions costs a hundred credits to answer a
+ * yes/no that thirty answers just as well.
+ */
+const TRADE_PROBE = Number(process.env.TRADE_PROBE ?? 30);
+
+/**
+ * Did this wallet ever buy or sell this token, as opposed to just holding it?
+ *
+ * Holding is not trading, and the wallet page cannot tell them apart on its
+ * own: it lists token ACCOUNTS, so an airdrop the owner never touched looks
+ * exactly like a position they built. Offering those for indexing is offering
+ * a replay with nothing in it — and, worse, offering to spend a build on one.
+ *
+ * Read newest-first, because a wallet that trades at all usually traded
+ * recently. The important part is the `complete` test: a definite "no" is only
+ * safe when the whole of the wallet's history on this mint fitted in one probe.
+ * Past that the honest answer is "do not know", and a row is kept rather than
+ * hidden — a false positive shows one dead row, a false negative hides a
+ * replay somebody came for.
+ */
+export async function tradedOn(mint: string, wallet: string): Promise<boolean> {
+  /**
+   * Cached, because the wallet page asks this forty-odd times at once.
+   *
+   * Ten credits a row is nothing; forty rows on every page load is 440, and
+   * forty CONCURRENT reads is what actually hurts — ten visitors at once puts
+   * four hundred calls in flight and the governor queues them, so everybody
+   * waits. The answer barely moves: a wallet that has traded a token has
+   * traded it for ever, and one that has not is only one swap away from
+   * flipping, which the shorter miss TTL covers.
+   */
+  const key = `traded:${mint}:${wallet}`;
+  const held = await loadBlob<{ at: number; traded: boolean }>(key);
+  if (held && nowSec() - held.at < (held.traded ? TRADED_TTL : TRADED_MISS_TTL)) {
+    return held.traded;
   }
 
+  const answer = await probeTraded(mint, wallet);
+  await saveBlob(key, { at: nowSec(), traded: answer });
+  return answer;
+}
+
+/**
+ * The same question for many mints at once, which is how the wallet page asks.
+ *
+ * One batched cache read for the whole page, then probes only for what is
+ * missing — rather than forty independent round trips to answer forty
+ * questions that are usually all already answered.
+ */
+export async function tradedOnMany(
+  pairs: { mint: string; wallet: string }[],
+): Promise<Map<string, boolean>> {
+  const keys = pairs.map((p) => `traded:${p.mint}:${p.wallet}`);
+  const held = await loadBlobs<{ at: number; traded: boolean }>(keys);
+  const out = new Map<string, boolean>();
+  const ask: { mint: string; wallet: string }[] = [];
+
+  pairs.forEach((p, i) => {
+    const hit = held.get(keys[i]!);
+    const fresh =
+      hit && nowSec() - hit.at < (hit.traded ? TRADED_TTL : TRADED_MISS_TTL);
+    if (fresh) out.set(p.mint, hit!.traded);
+    else ask.push(p);
+  });
+
+  const fresh = await Promise.all(
+    ask.map(async (p) => ({ ...p, traded: await probeTraded(p.mint, p.wallet) })),
+  );
+  const at = nowSec();
+  await saveBlobs(
+    fresh.map((f) => ({
+      key: `traded:${f.mint}:${f.wallet}`,
+      value: { at, traded: f.traded },
+    })),
+  );
+  for (const f of fresh) out.set(f.mint, f.traded);
+  return out;
+}
+
+const TRADED_TTL = Number(process.env.TRADED_TTL ?? 30 * 24 * 3_600);
+const TRADED_MISS_TTL = Number(process.env.TRADED_MISS_TTL ?? 6 * 3_600);
+
+async function probeTraded(mint: string, wallet: string): Promise<boolean> {
+  const res = await archive(wallet, undefined, "desc", tradeFilter(mint), TRADE_PROBE);
+  const rows = res?.data ?? [];
+  if (rows.length === 0) return false;
+
+  const txs: NormalizedTx[] = [];
+  for (const raw of rows) {
+    const tx = adapt(raw);
+    if (tx && !tx.failed) txs.push(tx);
+  }
+  // Prices are irrelevant to the question; a zero mark keeps it free. An
+  // unloaded SOL history quotes zero too, so `execPrice` resolves nothing and
+  // every fill falls through to that mark — no Binance fetch, no credits.
+  const fills = await walletFills(txs, mint, wallet, () => 0, new SolPriceHistory());
+  if (fills.some((f) => f.kind !== "transfer")) return true;
+
+  // Nothing but transfers — trustworthy only if that was all there was.
+  return rows.length >= TRADE_PROBE;
+}
+
+/**
+ * The chart a wallet's replay needs: which bar width, over what span.
+ *
+ * Extracted because two places have to agree on it exactly. The replay derives
+ * it when somebody clicks; the board pre-builds it in advance so that click is
+ * instant. Any drift between the two and the pre-build fills a different cache
+ * key from the one the click looks in — the work gets done, paid for, and
+ * never used.
+ *
+ * The bar width comes from the WALLET's span, not the token's, which is the
+ * whole reason this differs per wallet: a trader who was in for ten minutes is
+ * one candle on the token's own two-hour chart, and no replay at all.
+ */
+/**
+ * The finest bar a replay will draw, and how many of them it will draw.
+ *
+ * `pickInterval` widens fast because it is shared with the whole-life chart,
+ * where a year of fifteen-minute bars is 35,000 candles nobody can read. A
+ * replay is a different question: it covers ONE wallet's window, so the same
+ * ladder hands a wallet that traded for three days 15m bars and a wallet that
+ * traded for three weeks 2h bars — a visible difference between two rows of
+ * the same board, and nothing to do with which token they are on.
+ *
+ * So a replay steps back down to 15m whenever the window still fits in a
+ * readable chart. At 3,000 bars that covers any wallet active up to about a
+ * month, which is the rung — "≤30 days → 2h" — where the jump was widest.
+ */
+const REPLAY_FINE = Number(process.env.HISTORY_REPLAY_FINE ?? 900);
+const REPLAY_MAX_BARS = Number(process.env.HISTORY_REPLAY_MAX_BARS ?? 3_000);
+
+/** The finest bar this span may be drawn at, never coarser than the ladder. */
+function replayInterval(spanSec: number): number {
+  const ladder = pickInterval(spanSec);
+  if (ladder <= REPLAY_FINE) return ladder;
+  return spanSec / REPLAY_FINE <= REPLAY_MAX_BARS ? REPLAY_FINE : ladder;
+}
+
+export function replayWindow(
+  firstTs: number,
+  lastTs: number,
+  leadSec: number,
+): { interval: number; from: number; to: number } {
+  const traded = Math.max(lastTs - firstTs, 0);
+  const interval = replayInterval(traded + leadSec);
+  const pad = interval * MIN_CANDLES;
+  return {
+    interval,
+    from: firstTs - Math.max(leadSec, pad / 2),
+    to: Math.min(lastTs + Math.max(interval, pad / 2), nowSec()),
+  };
+}
+
+/**
+ * A wallet's replay, and the material the curve is drawn from.
+ *
+ * Separate from `reconstruct` rather than a parameter on it, because the two
+ * are different requests that happen to share an endpoint: this is bounded by
+ * one wallet's own history and is the cheap path, and the other is the token's
+ * entire life. Keeping them apart is also what removes the trapdoor — a wallet
+ * with nothing on the mint used to fall through and rebuild the whole token.
+ */
+export interface WalletReplay {
+  history: TokenHistory;
+  fills: HistoryFill[];
+  interval: number;
+}
+
+/**
+ * What a caller is allowed to spend on one wallet replay.
+ *
+ * The wallet window is the only build a visitor can start, so it carries all
+ * the weight that the read-only flag used to. Every field here bounds a
+ * different way the same request can turn expensive: how much of the wallet's
+ * history is read, how many wallets are read at once, and how much of the
+ * token has to be drawn to show it.
+ */
+export interface ReplayLimits {
+  /** Pages of the wallet's own transactions. The owner's default is 12. */
+  pages: number;
+  /** Cluster members read alongside the subject. */
+  cluster: number;
+  /**
+   * Bars this request may BUILD, over and above what is already cached.
+   *
+   * A backstop, not the real limit — see `credits`. Note the FLOOR: every
+   * replay window is padded by `MIN_CANDLES` either side so a recording opens
+   * on the token already moving, which makes the narrowest possible window
+   * sixty bars wide. Setting this to sixty therefore refuses essentially every
+   * cold build, which is exactly what it did.
+   */
+  buildBars: number;
+  /**
+   * Credits this request may spend, enforced by the meter as it goes.
+   *
+   * The honest bound, because bars are a poor proxy for cost: `pickInterval`
+   * already keeps any wallet window under about 460 bars however long the
+   * wallet held, and the ninefold difference between a sampled bar and an
+   * exact one is invisible to a bar count. A hundred and sixty bars measured
+   * at 16,391 credits sampled; the same count read exactly would be nearer
+   * two thousand.
+   */
+  credits: number;
+}
+
+export const OWNER_LIMITS: ReplayLimits = {
+  pages: WALLET_PAGES,
+  cluster: 8,
+  buildBars: Number.POSITIVE_INFINITY,
+  credits: Number.POSITIVE_INFINITY,
+};
+
+export const VISITOR_LIMITS: ReplayLimits = {
+  pages: Number(process.env.VISITOR_WALLET_PAGES ?? 3),
+  cluster: Number(process.env.VISITOR_CLUSTER ?? 1),
+  // Comfortably clear of the sixty-bar padding floor.
+  buildBars: Number(process.env.VISITOR_MAX_BARS ?? 500),
+  /**
+   * MEASURED against real windows rather than picked: an ordinary wallet's
+   * window on a busy token costs about 4,000, and the ones that genuinely
+   * belong in the queue cost 33,000 to 63,000. Ten thousand sits in the gap.
+   */
+  credits: Number(process.env.VISITOR_MAX_CREDITS ?? 10_000),
+};
+
+/**
+ * Thrown when a request is refused for being too large, not for failing.
+ *
+ * Carries the estimate, because "no" on its own is a dead end: the caller
+ * turns these numbers into "queued, about a minute" rather than an error.
+ */
+export class TooLarge extends Error {
+  constructor(
+    message: string,
+    readonly estimate: {
+      bars: number;
+      credits: number;
+      seconds: number;
+      /**
+       * The exact window that was refused, so the queue can build THAT.
+       *
+       * Not optional, and not something the worker can re-derive. A wallet's
+       * bar width comes from its own trading span, and the token's whole-life
+       * chart uses a different rung entirely — MEASURED on a 27-day token, the
+       * whole-life build picks 7,200s bars while the wallet needed 900s. A
+       * worker told only the mint would build the wrong series, the click
+       * would be refused again for the same reason, and the queue would loop
+       * for ever while spending real money each time round.
+       */
+      interval: number;
+      from: number;
+      to: number;
+    },
+  ) {
+    super(message);
+    this.name = "TooLarge";
+  }
+}
+
+/**
+ * Build one window of a token's chart, at one bar width.
+ *
+ * What the queue worker runs. Deliberately narrower than `reconstruct`: the
+ * thing somebody is waiting for is their own replay, and that needs the series
+ * at THEIR rung over THEIR window — not the token's whole life at whatever
+ * width suits the token. Building the wrong one costs the same and helps
+ * nobody.
+ *
+ * Unbounded, because this is the owner's budget being spent once for everyone
+ * who asks for that token afterwards.
+ */
+export async function buildWindow(
+  mint: string,
+  interval: number,
+  from: number,
+  to: number,
+): Promise<number> {
+  return priced(`build ${mint} @${interval}s`, async () => {
+    const venue = await stage("venue", () => venueFor(mint));
+    if (!venue) return 0;
+    const sol = new SolPriceHistory();
+    await sol.load(from, to);
+    const drawn = await stage("candles", () =>
+      series(venue, mint, from, to, interval, sol),
+    );
+    await remember(mint, interval, drawn.candles, "window");
+    return drawn.candles.length;
+  });
+}
+
+export async function walletReplay(
+  mint: string,
+  wallet: string,
+  leadSec = 300,
+  alongside: string[] = [],
+  limits: ReplayLimits = OWNER_LIMITS,
+  section?: ZoomSection,
+): Promise<WalletReplay | null> {
+  const cluster = alongside.slice(0, Math.max(0, limits.cluster));
+  /**
+   * Keyed on everything that changes the answer.
+   *
+   * The subject, who is replayed alongside it, and the run-up all alter both
+   * the window and the curve, so a key of the mint alone would hand one
+   * wallet's replay to a request asking about another.
+   */
+  const key =
+    `${mint}|${wallet}|${[...cluster].sort().join(",")}|${leadSec}|${limits.pages}` +
+    // The section changes the candles, so two requests picking different
+    // stretches must not share one in-flight build.
+    `|${section ? `${section.from}-${section.to}` : ""}`;
+  const running = walletsInFlight.get(key);
+  if (running) return running;
+
+  const pending = priced(
+    `wallet ${mint} ${wallet}`,
+    () => walletHistory(mint, wallet, leadSec, cluster, limits, section),
+    limits.credits,
+  );
+  walletsInFlight.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    // Shared while it runs, kept afterwards by nobody: a replay's value is
+    // that it is current, and this path was never cached before.
+    walletsInFlight.delete(key);
+  }
+}
+
+/**
+ * The token's whole life, at one bar width.
+ *
+ * A wallet's replay is NOT this with an extra argument — it is `walletReplay`,
+ * bounded by that wallet's own history. Keeping them apart is what closed the
+ * trapdoor where naming a wallet with nothing on the mint fell through to the
+ * most expensive request the app can make.
+ */
+/**
+ * Everything about a whole-life chart that is expensive and does not change.
+ *
+ * NOT the candles. Those live in `series:{mint}:{interval}` and `series()`
+ * rewrites that blob on every top-up, so a second copy here would disagree
+ * with it the moment any instance refreshed — and then go on serving stale
+ * bars, because nothing would ever rewrite it. There is one home for bars.
+ *
+ * `lastTs` is absent for the same reason in reverse: it moves whenever the
+ * token trades, and reusing a stored one would draw the window up to where the
+ * token was when this was written, so the newest-bar refresh would refresh a
+ * bar days old and the chart would quietly stop.
+ */
+interface ChartMeta {
+  interval: number;
+  firstTs: number;
+  swaps: number;
+  supply: number;
+  venue: Venue;
+  name?: string;
+  symbol?: string;
+  image?: string;
+  at: number;
+}
+
+/**
+ * How long the derived figures stand before being worked out again.
+ *
+ * `swaps` comes from integrating the density map and `supply` from a supply
+ * lookup, and both genuinely move: the lifetime swap count of a live token
+ * climbs, and supply changes when tokens are burned or minted. Caching them
+ * forever would freeze the number under the chart and the market-cap axis it
+ * is drawn against.
+ */
+const META_TTL = Number(process.env.HISTORY_META_TTL ?? 6 * 3_600);
+
+
+async function reconstructInner(
+  mint: string,
+  leadSec = 300,
+): Promise<TokenHistory | null> {
+  void leadSec;
   /**
    * The book, then how busy it was, then the chart.
    *
@@ -1582,31 +2383,59 @@ export async function reconstruct(
    * fetching a transaction. MEASURED, the first two steps together are about a
    * second and a half for a token with 1.8 million swaps behind it.
    */
-  const venue = await stage("venue", () => venueFor(mint));
+  const cachedMeta = await loadBlob<ChartMeta>(`chart:${mint}`);
+  const metaFresh = cachedMeta !== null && nowSec() - cachedMeta.at < META_TTL;
+
+  const venue = cachedMeta?.venue ?? (await stage("venue", () => venueFor(mint)));
   if (!venue) return null;
 
+  /**
+   * `poolLifespan` is paid even on a cache hit, and it is worth it.
+   *
+   * It is the only thing that knows where the token is NOW — two calls and
+   * about twenty credits against the four hundred or so that skipping the
+   * density map, the asset lookup and the supply read saves. Taking the stored
+   * `lastTs` instead would put every bar built since outside the requested
+   * window, so `missingRanges` would never ask for them.
+   */
   const life = await stage("lifespan", () => poolLifespan(venue, mint));
   if (!life) return null;
-  const firstTs = life.first;
+  const firstTs = cachedMeta?.firstTs ?? life.first;
   const lastTs = life.last;
-  const interval = pickInterval(lastTs - firstTs);
+  /**
+   * The stored bar width is kept, not recomputed.
+   *
+   * `pickInterval` widens with the span, so a live token eventually crosses a
+   * rung and the same chart would start writing `series:{mint}:{wider}` — a
+   * key with nothing in it, i.e. a full rebuild from nothing, triggered by
+   * nothing more than the token ageing a day. The staleness refresh below is
+   * the one place allowed to change it.
+   */
+  const interval = metaFresh && cachedMeta ? cachedMeta.interval : pickInterval(lastTs - firstTs);
 
   // `series` loads the SOL prices it needs; the whole span is rarely one of
   // them, since most of a rebuilt token comes from the cache.
   const sol = new SolPriceHistory();
 
   // The whole-life map is worth its forty probes here: it is what tells the
-  // page how many swaps the token has ever had.
-  const density = await stage("density", () => densityMap(venue.pool, mint, firstTs, lastTs));
+  // page how many swaps the token has ever had. Skipped while the stored
+  // figure is still fresh, which is most warm requests.
+  const density = metaFresh
+    ? null
+    : await stage("density", () => densityMap(venue.pool, mint, firstTs, lastTs));
   const drawn = await stage("candles", () =>
     series(venue, mint, firstTs, Math.min(lastTs, nowSec()) + interval, interval, sol),
   );
   if (drawn.candles.length === 0) return null;
 
-  const [token, supply] = await Promise.all([
-    tokenIdentity(mint),
-    tokenSupply(mint),
-  ]);
+  const [token, supply] = metaFresh && cachedMeta
+    ? [
+        { name: cachedMeta.name, symbol: cachedMeta.symbol, image: cachedMeta.image },
+        cachedMeta.supply,
+      ]
+    : await Promise.all([tokenIdentity(mint), tokenSupply(mint)]);
+
+  const swaps = density ? Math.round(density.total) : (cachedMeta?.swaps ?? 0);
   const history: TokenHistory = {
     mint,
     ...token,
@@ -1614,16 +2443,28 @@ export async function reconstruct(
     supply,
     fills: 0,
     transactions: 0,
-    swaps: Math.round(density.total),
+    swaps,
     interval,
     firstTs,
     lastTs,
     venue: venue.pool,
     exact: drawn.exact,
   };
-  cache.set(mint, { at: Date.now(), history });
+
+  if (!metaFresh) {
+    await saveBlob(`chart:${mint}`, {
+      interval,
+      firstTs,
+      swaps,
+      supply,
+      venue,
+      ...token,
+      at: nowSec(),
+    } satisfies ChartMeta);
+  }
+
   // The page offers these back; a token already built redraws in ~2s.
-  await remember(mint, interval, drawn.candles, {
+  await remember(mint, interval, drawn.candles, "full", {
     ...token,
     firstTs,
     lastTs,
@@ -1643,7 +2484,145 @@ export async function reconstruct(
  * Expensive, and cached durably for that reason: a token's finished traders do
  * not change, so this is a cost paid once rather than once per visitor.
  */
+/**
+ * Wallets whose replay is pre-built when a board is.
+ *
+ * Per side, so ten means the top ten and the bottom ten. These are the names
+ * somebody will actually click — nobody opens the fortieth row — and each one
+ * they click without this waits a minute for a chart to be built.
+ */
+const PREBUILD_ROWS = Number(process.env.BOARD_PREBUILD_ROWS ?? 10);
+
+/** The run-up the replay path defaults to; the pre-build must match it. */
+const LEAD_SEC = 300;
+
+/**
+ * Credits the pre-build may spend before it stops and leaves the rest to the
+ * queue. A ceiling, not a target: most of these are cache hits.
+ */
+const PREBUILD_CREDITS = Number(process.env.BOARD_PREBUILD_CREDITS ?? 150_000);
+
+/**
+ * Draw the charts the board's own wallets will ask for, while indexing.
+ *
+ * The gap this closes is the one nobody expects: a token is fully indexed, its
+ * board is on screen, you click a name off it — and wait, because a wallet's
+ * replay is drawn at ITS bar width and only the token's own was built. On this
+ * token the board is at 7,200s bars and its wallets have wanted 28,800s.
+ *
+ * Nothing here is newly discovered. `exactBoard` has just read every ranked
+ * wallet's complete history to rank them at all, so the first and last trade
+ * of each is already in hand — this only stops throwing that away.
+ *
+ * Ordered by rank and budgeted rather than exhaustive, because the windows
+ * overlap: once the first wallet at a given bar width is drawn, the next one
+ * at that width is mostly a cache hit, and the tail is wallets nobody opens.
+ */
+async function prebuildReplays(
+  venue: Venue,
+  mint: string,
+  board: TraderBoard,
+  fills: HistoryFill[],
+): Promise<void> {
+  const span = new Map<string, { first: number; last: number }>();
+  for (const f of fills) {
+    if (!f.wallet) continue;
+    const held = span.get(f.wallet);
+    if (held) {
+      held.first = Math.min(held.first, f.ts);
+      held.last = Math.max(held.last, f.ts);
+    } else {
+      span.set(f.wallet, { first: f.ts, last: f.ts });
+    }
+  }
+
+  const wanted = [
+    ...board.top.slice(0, PREBUILD_ROWS),
+    ...board.bottom.slice(0, PREBUILD_ROWS),
+  ];
+
+  // One entry per distinct chart, so wallets sharing a bar width and an
+  // overlapping span are drawn once rather than once each.
+  const charts = new Map<string, { interval: number; from: number; to: number }>();
+  for (const row of wanted) {
+    const seen = span.get(row.wallet);
+    if (!seen) continue;
+    const w = replayWindow(seen.first, seen.last, LEAD_SEC);
+    const key = `${w.interval}`;
+    const held = charts.get(key);
+    if (held) {
+      /**
+       * Only widened where it actually overlaps — and only while the result is
+       * still a chart worth drawing.
+       *
+       * The bar-count test matters now that a replay can be 15m wide: merging
+       * two overlapping month-long windows at that width is four thousand bars
+       * of a busy token, and `series` holds every response of a sweep at once.
+       * Refusing the merge costs one extra chart; taking it costs the build.
+       */
+      const merged = {
+        from: Math.min(held.from, w.from),
+        to: Math.max(held.to, w.to),
+      };
+      if (
+        w.from <= held.to &&
+        w.to >= held.from &&
+        (merged.to - merged.from) / w.interval <= REPLAY_MAX_BARS
+      ) {
+        held.from = merged.from;
+        held.to = merged.to;
+        continue;
+      }
+      charts.set(`${key}:${w.from}`, w);
+      continue;
+    }
+    charts.set(key, w);
+  }
+
+  const before = spentSoFar();
+  for (const w of charts.values()) {
+    if (spentSoFar() - before > PREBUILD_CREDITS) {
+      if (DEBUG) console.log("[history] prebuild: budget reached, leaving the rest");
+      break;
+    }
+    try {
+      const sol = new SolPriceHistory();
+      await sol.load(w.from, w.to);
+      const drawn = await series(venue, mint, w.from, w.to, w.interval, sol);
+      await remember(mint, w.interval, drawn.candles, "window");
+    } catch {
+      // A chart that will not draw now is one the queue can pick up later.
+    }
+  }
+  if (DEBUG) {
+    console.log(
+      `[history] prebuild: ${charts.size} charts for ${wanted.length} ranked wallets`,
+    );
+  }
+}
+
 export async function traderBoard(
+  mint: string,
+  update = false,
+  pin: string[] = [],
+  /**
+   * Whether this caller may BUILD a board that does not exist yet.
+   *
+   * Defaults true so the indexer, which calls this in-process, keeps working
+   * unchanged; the routes pass the answer from `owner(request)`. Without it a
+   * board is served if one is stored and refused if not, which is the only
+   * safe behaviour on a path anyone can reach: nomination plus reading two
+   * hundred wallets in full is minutes of work and the single most expensive
+   * thing this app does.
+   */
+  mayBuild = true,
+): Promise<TraderBoard | null> {
+  return priced(`board ${mint}${update ? " (update)" : ""}`, () =>
+    traderBoardInner(mint, update, pin, mayBuild),
+  );
+}
+
+async function traderBoardInner(
   mint: string,
   /**
    * Read what has happened since the last build before ranking.
@@ -1661,11 +2640,22 @@ export async function traderBoard(
    * across later builds.
    */
   pin: string[] = [],
+  mayBuild = true,
 ): Promise<TraderBoard | null> {
   const key = `board:${mint}`;
   const stateKey = `boardstate:${mint}`;
   const held = await loadBlob<TraderBoard>(key);
   const state = await loadBlob<BoardState>(stateKey);
+
+  /**
+   * Nothing stored and no permission to build: stop before spending anything.
+   *
+   * Placed above `venueFor` deliberately. Discovery is a handful of calls on a
+   * mint nobody has looked at, and doing it only to refuse afterwards is a
+   * cost a visitor can trigger repeatedly just by asking for boards that do
+   * not exist.
+   */
+  if (!mayBuild && !held) return null;
 
   const venue = await stage("venue", () => venueFor(mint));
   if (!venue) return held ?? null;
@@ -1689,19 +2679,48 @@ export async function traderBoard(
    */
   const alreadyPinned = pin.every((w) => state?.candidates.includes(w));
 
+  /**
+   * Supply, for telling a token's plumbing apart from its traders.
+   *
+   * Read from the chart's cached metadata rather than looked up: `reconstruct`
+   * has already paid for it, this is a blob read, and a board built for a mint
+   * with no chart yet simply gets 0 — which turns the test off rather than
+   * guessing at it.
+   */
+  const supply = (await loadBlob<ChartMeta>(`chart:${mint}`))?.supply ?? 0;
+
   if (held && state && !update && alreadyPinned) {
     if (price <= 0) return held;
     const book = new PositionBook();
     book.restore(mint, state.positions);
     const before = Object.keys(state.names ?? {}).length;
-    const board = await rank(mint, book, price, state, held.builtAt);
+    const wasV = state.namesV;
+    const board = await rank(mint, book, price, state, held.builtAt, supply);
     await saveBlob(key, board);
-    // Only when the lookup actually learned something.
-    if (Object.keys(state.names ?? {}).length !== before) {
+    /**
+     * Only when the lookup actually learned something — or re-asked.
+     *
+     * The count alone cannot tell: a re-ask clears the map and refills it with
+     * the same sixty wallets, so an unsaved bump would leave every later read
+     * paying for the same lookup all over again.
+     */
+    if (
+      Object.keys(state.names ?? {}).length !== before ||
+      state.namesV !== wasV
+    ) {
       await saveBlob(stateKey, state);
     }
     return board;
   }
+
+  /**
+   * Past here is the build, and it is minutes of work.
+   *
+   * Reaching this point without permission means the stored board could not
+   * answer — no state, or the caller asked for an update. A visitor gets what
+   * is stored, re-marked, or nothing; only the owner gets the wallets read.
+   */
+  if (!mayBuild) return held ?? null;
 
   const life = await stage("lifespan", () => poolLifespan(venue, mint));
   if (!life) return held ?? null;
@@ -1712,8 +2731,9 @@ export async function traderBoard(
     (await loadSeries(mint, interval))?.candles ??
     (await series(venue, mint, life.first, Math.min(life.last, nowSec()) + interval, interval, sol))
       .candles;
-  await remember(mint, interval, drawn);
-  const priceAt = priceLookup(drawn);
+  // The board draws the token's whole life to price its fills.
+  await remember(mint, interval, drawn, "full");
+  const priceAt = priceLookup(await pricingSeries(venue, mint, life, interval, drawn, sol));
 
   /**
    * An update keeps the candidates it already has and only reads what is new.
@@ -1763,10 +2783,9 @@ export async function traderBoard(
   if (candidates.length === 0) return held ?? null;
 
   const { book, fills } = await stage("board", () =>
-    exactBoard(mint, candidates, priceAt, carry),
+    exactBoard(mint, candidates, priceAt, sol, carry),
   );
 
-  histories.set(`${mint}|`, { book, fills, interval });
   if (price <= 0) return held ?? null;
 
   const next: BoardState = {
@@ -1777,21 +2796,159 @@ export async function traderBoard(
     pinned,
   };
   next.names = state?.names ?? {};
-  const board = await rank(mint, book, price, next, nowSec());
+  const board = await rank(mint, book, price, next, nowSec(), supply);
   await saveBlob(key, board);
   await saveBlob(stateKey, next);
+
+  /**
+   * Saved BEFORE the pre-build, so a slow one cannot cost the board.
+   *
+   * The board is the answer somebody asked for; the pre-built replays are work
+   * done in advance for a click that has not happened yet. If drawing them
+   * fails or runs out of budget, the board is already on disk and the queue
+   * picks up whatever is missing the first time anyone asks.
+   */
+  await stage("prebuild", () => prebuildReplays(venue, mint, board, fills));
   return board;
 }
 
+
+/**
+ * Days from launch drawn finely, for pricing rather than for looking at.
+ *
+ * The whole-life series is what the CHART shows, and at a bar every 2.67 days
+ * it is fine for that — the token spends most of its life going nowhere. It is
+ * not fine for pricing a fill, and the error is not spread evenly: a bar's
+ * close is only as good as the price is steady across it, so a flat month is
+ * priced almost exactly and the launch is priced not at all.
+ *
+ * MEASURED, that is where the money is. Roughly a quarter of the proceeds on
+ * both boards come from tokens LEAVING a wallet — an exchange deposit has no
+ * quote leg, so it can only be priced from the chart — and those exits cluster
+ * in the first days, exactly where a 2.67-day bar spans a 3x move.
+ *
+ * So the fix is resolution where price moves, not resolution everywhere: a
+ * uniform four-hour rebuild costs ~593,000 credits a token and spends most of
+ * it on the flat tail, where the coarse bar was already right.
+ */
+const LAUNCH_DAYS = Number(process.env.HISTORY_LAUNCH_DAYS ?? 14);
+const LAUNCH_INTERVAL = Number(process.env.HISTORY_LAUNCH_INTERVAL ?? 1_800);
+/** Credits the fine launch window may cost before the coarse series stands. */
+const LAUNCH_CREDITS = Number(process.env.HISTORY_LAUNCH_CREDITS ?? 250_000);
+
+/**
+ * The coarse whole-life series with a fine launch window spliced into it.
+ *
+ * Returned as ONE array of mixed bar widths, which `priceLookup` handles by
+ * construction — it binary-searches the times that are actually there rather
+ * than computing a bucket, precisely so a spliced section works.
+ *
+ * Not written back to `series:{mint}:{interval}`. That blob is the chart, it
+ * is keyed by a single bar width, and `missingRanges` reasons about it in
+ * whole buckets of that width; mixing widths into it would make later top-ups
+ * disagree with themselves. The fine bars go in their own key, where they are
+ * also reusable, and the splice happens in memory.
+ */
+async function pricingSeries(
+  venue: Venue,
+  mint: string,
+  life: { first: number; last: number },
+  interval: number,
+  coarse: Candle[],
+  sol: SolPriceHistory,
+): Promise<Candle[]> {
+  // Nothing to gain when the chart is already finer than the launch window.
+  if (interval <= LAUNCH_INTERVAL) return coarse;
+
+  const to = Math.min(life.first + LAUNCH_DAYS * 86_400, life.last, nowSec());
+  if (to <= life.first) return coarse;
+
+  let fine: Candle[] = [];
+  try {
+    fine = (
+      await priced(
+        `launch ${mint}`,
+        () => series(venue, mint, life.first, to, LAUNCH_INTERVAL, sol),
+        LAUNCH_CREDITS,
+      )
+    ).candles;
+  } catch (error) {
+    /**
+     * A refusal here costs precision, never the board.
+     *
+     * The coarse series is already in hand and already prices every fill; this
+     * only makes the early ones better. Losing it to a budget ceiling on a
+     * token with a very busy launch is the correct trade, and silently
+     * carrying on with worse prices would not be.
+     */
+    console.warn(
+      `[history] launch window not drawn for ${mint}: ${(error as Error).message}`,
+    );
+    return coarse;
+  }
+  if (fine.length === 0) return coarse;
+
+  const firstFine = fine[0]!.t;
+  const lastFine = fine[fine.length - 1]!.t + LAUNCH_INTERVAL;
+  const spliced = [
+    ...coarse.filter((c) => c.t + interval <= firstFine),
+    ...fine,
+    ...coarse.filter((c) => c.t >= lastFine),
+  ];
+  if (DEBUG) {
+    console.log(
+      `[history] pricing series: ${coarse.length} coarse bars + ${fine.length} fine ` +
+        `(${LAUNCH_INTERVAL}s over ${LAUNCH_DAYS}d) = ${spliced.length}`,
+    );
+  }
+  return spliced;
+}
+
 /** Order a book at a price. Shared by the cached read and the fresh build. */
+/**
+ * Share of a token's whole supply a wallet can be HANDED before it is
+ * infrastructure rather than a trader.
+ *
+ * Nobody is given five percent of a token for nothing and then trades it. The
+ * wallets on the far side of this line are minters, treasuries, liquidity
+ * managers and exchange hot wallets, and their PnL is not a trade — it is the
+ * token's own plumbing moving through them.
+ *
+ * MEASURED, and the gap either side is what makes it safe: on MELANIA the
+ * shares are 102.92% (the minter, which handled the entire supply), 10.78%
+ * (its liquidity account), then 1.00% for the next wallet down. On TRUMP,
+ * 5.40% then 0.55%. There is no trader anywhere near the boundary.
+ */
+const INFRA_SUPPLY_SHARE = Number(process.env.HISTORY_INFRA_SUPPLY_SHARE ?? 0.05);
+
 async function rank(
   mint: string,
   book: PositionBook,
   price: number,
   state: BoardState,
   builtAt: number,
+  /** Circulating supply, for the infrastructure test. 0 disables it. */
+  supply = 0,
 ): Promise<TraderBoard> {
-  const ranked = book.leaderboard(mint, price, BOARD_ROWS);
+  /**
+   * Twice as deep as the board shows, because rows are about to be REMOVED.
+   *
+   * Filtering infrastructure out of an already-trimmed list would leave the
+   * board short by however many it dropped — and the wallets it drops are
+   * near the top, where a gap is most visible.
+   */
+  const ranked = book.leaderboard(mint, price, BOARD_ROWS * 2);
+
+  /**
+   * Handed a large share of the supply: a minter, a treasury, an LP manager.
+   *
+   * Behavioural rather than by name, because Helius calls these plain wallets
+   * — MEASURED, both "Melania Meme Token Minter" and "Melania Meme Liquidity
+   * 2" come back with `type: "wallet"`, indistinguishable from a person. Only
+   * the bridge vault self-identifies, and that is handled below.
+   */
+  const distributor = (r: PnlRow): boolean =>
+    supply > 0 && r.receivedBase / supply > INFRA_SUPPLY_SHARE;
 
   /**
    * Names for the rows that will actually be shown.
@@ -1801,7 +2958,11 @@ async function rank(
    * reads. Only addresses not already in the stored map are asked about, so a
    * board that has been read once never asks again.
    */
-  const shown = [...ranked.top, ...ranked.bottom];
+  const shown = [...ranked.top, ...ranked.bottom].filter((r) => !distributor(r));
+  if (state.namesV !== NAMES_V) {
+    state.names = {};
+    state.namesV = NAMES_V;
+  }
   const known = (state.names ??= {});
   const missing = shown.map((r) => r.wallet).filter((w) => !(w in known));
   if (missing.length > 0) {
@@ -1809,7 +2970,9 @@ async function rank(
     // Absent is recorded too, so an unnamed wallet is not looked up forever.
     for (const wallet of missing) {
       const hit = found.get(wallet);
-      known[wallet] = hit ? { name: hit.name, category: hit.category } : {};
+      known[wallet] = hit
+        ? { name: hit.name, category: hit.category, type: hit.type }
+        : {};
     }
   }
   for (const row of shown) {
@@ -1820,8 +2983,18 @@ async function rank(
     }
   }
 
+  /**
+   * A protocol's own account, where Helius says so outright.
+   *
+   * Catches what the supply test cannot: a bridge vault moves other people's
+   * tokens and need never hold much of the supply at once. MEASURED, the
+   * DeBridge vault sat on the MELANIA losers board at -$1.1m.
+   */
+  const protocolOwned = (r: PnlRow): boolean => known[r.wallet]?.type === "protocol";
+  const tradersOnly = (r: PnlRow): boolean => !distributor(r) && !protocolOwned(r);
+
   return {
-    top: ranked.top.filter((r) => r.total > 0),
+    top: ranked.top.filter((r) => r.total > 0 && tradersOnly(r)).slice(0, BOARD_ROWS),
     /**
      * Only wallets that actually lost.
      *
@@ -1830,7 +3003,9 @@ async function rank(
      * wallet up sixty-four dollars under a heading saying "lost the most". A
      * short honest list beats a full dishonest one.
      */
-    bottom: ranked.bottom.filter((r) => r.total < 0),
+    bottom: ranked.bottom
+      .filter((r) => r.total < 0 && tradersOnly(r))
+      .slice(0, BOARD_ROWS),
     wallets: ranked.wallets,
     truncated: state.considered > BOARD_CANDIDATES,
     builtAt,
@@ -1847,41 +3022,39 @@ async function rank(
 const LEAD_BARS = Number(process.env.HISTORY_LEAD_BARS ?? 8);
 
 /** Reconstructed books, kept so a replay does not re-read the chain. */
-const histories = new Map<
-  string,
-  { book: PositionBook; fills: HistoryFill[]; interval: number }
->();
-
 /**
  * One wallet's replay over a reconstructed history.
  *
  * `leadSec` is the run-up: the chart starts before the wallet's first trade so
  * a recording opens on the token in motion rather than on the wallet's entry.
  */
-/** The key a cluster's book is filed under. Order-independent. */
-function clusterKey(mint: string, cluster: string[]): string {
-  return `${mint}|${[...cluster].sort().join(",")}`;
-}
-
 export function replayFrom(
   mint: string,
   wallet: string,
   candles: Candle[],
+  /** The fills and bar width `walletReplay` just produced for this cluster. */
+  replay: { fills: HistoryFill[]; interval: number },
   leadSec = 300,
   alongside: string[] = [],
-): { points: ReplayPoint[]; candles: Candle[]; trades: HistoryFill[] } | null {
+): { points: ReplayPoint[]; candles: Candle[]; trades: HistoryFill[] } {
   /**
-   * The wallet's OWN book first.
+   * Given the fills, not fetching them — and that is the whole point.
    *
-   * The board keeps a second book for the same mint, holding a hundred and
-   * twenty wallets with their fills bounded. Reading the replay out of
-   * whichever book was written last gave a curve that stopped partway; the
-   * wallet-specific one is complete by construction.
+   * This used to read a module-level Map that `walletHistory` had written a
+   * few milliseconds earlier in the same request. That was not a cache: the
+   * chart path skips its memo whenever a wallet is named, so the write and the
+   * read always happened together, and the Map was a way of returning a second
+   * value without changing a signature. It cost three bugs to keep — it never
+   * survived a process boundary, so any worker or second instance answered
+   * with an empty curve and a 200; it fell back to the BOARD's book for the
+   * mint, whose fills are capped at sixty per position, which is what produced
+   * replay curves that stopped partway; and it was never evicted.
+   *
+   * Passing the fills in makes it a pure function of its arguments. There is
+   * nothing left to miss, go stale, or leak.
    */
   const cluster = [wallet, ...alongside.filter((w) => w !== wallet)];
-  const held =
-    histories.get(clusterKey(mint, cluster)) ?? histories.get(`${mint}|`);
-  if (!held) return null;
+  const held = replay;
 
   const inCluster = new Set(cluster);
   const mine = held.fills.filter((f) => f.wallet && inCluster.has(f.wallet));
@@ -1904,10 +3077,10 @@ export function replayFrom(
   /**
    * Never before the first bar there is.
    *
-   * The run-up is measured back from the wallet's first trade, and a replay
-   * whose chart starts later than that would otherwise open at a time the
-   * series does not reach, placing every marker in the stretch it does not
-   * draw at a bar that does not exist.
+   * The run-up is measured back from the wallet's first trade, and a zoomed
+   * replay starts long after it — so without the floor the window opens at a
+   * time the series does not reach, and every marker in the stretch it does
+   * not draw is placed at a bar that does not exist.
    */
   const from = Math.max(
     Math.floor(firstTrade / held.interval) * held.interval -
@@ -1918,24 +3091,67 @@ export function replayFrom(
   const trades = mine.filter((f) => f.ts >= from);
   const closes = new Map(window.map((c) => [c.t, c.c]));
 
+  /**
+   * The book is rebuilt here rather than carried.
+   *
+   * `PositionBook.replay` walks the fills and recomputes quantity, basis and
+   * realized from scratch, so the only state it needs IS the fills. Every fill
+   * goes under the SUBJECT's key because a cluster is one position: a transfer
+   * between two wallets in it leaves one and enters the other, and booked
+   * together those cancel exactly, which is what makes the combined curve
+   * correct rather than a sum of two wrong ones.
+   */
+  const book = new PositionBook(Number.POSITIVE_INFINITY);
+  for (const f of held.fills) {
+    book.apply(mint, wallet, {
+      ts: f.ts,
+      isBuy: f.isBuy,
+      base: f.base,
+      usd: f.usd,
+      kind: f.kind,
+    });
+  }
+
   return {
     candles: window,
     trades,
-    points: held.book.replay(mint, wallet, closes, held.interval),
+    points: book.replay(mint, wallet, closes, held.interval),
   };
 }
 
-export const historyStats = () => ({ cached: histories.size });
 
 /** Tokens this install has already reconstructed. See `builtTokens`. */
 export async function replayable(): Promise<BuiltToken[]> {
-  return builtTokens();
+  return galleryTokens();
 }
 
 /** Whether a mint has been indexed, without building anything to find out. */
 export async function indexed(mint: string): Promise<boolean> {
-  const known = await builtTokens();
-  return known.some((t) => t.mint === mint);
+  return (await tokenRow(mint)) !== null;
+}
+
+/**
+ * What a request is ALLOWED to do with this mint, which is not the same as
+ * what has been built for it.
+ *
+ * `indexed()` was doing double duty: the routes used it to decide whether a
+ * request might proceed, so anything that put a row in the index also granted
+ * permission to rebuild that mint from scratch. Once visitors can create rows
+ * by replaying a wallet, that turns a ~15-credit request into a licence for a
+ * ~55,000-credit one.
+ *
+ * So coverage decides which PATH serves a request, never whether the request
+ * is permitted:
+ *
+ *   - any known mint may serve the wallet path
+ *   - only `full` may serve the mint-only chart from cache
+ *   - a mint-only request for anything else is a whole-life build, which is
+ *     owner-only
+ */
+export async function coverageOf(mint: string): Promise<Coverage | null> {
+  const row = await tokenRow(mint);
+  if (!row) return null;
+  return row.coverage ?? "full";
 }
 
 /** A linked wallet with its own complete PnL on this mint. */
@@ -1965,6 +3181,16 @@ export interface RelatedReport extends Omit<WalletGraph, "linked"> {
  * LINK is the inference; the money is not.
  */
 export async function relatedWallets(
+  mint: string,
+  wallet: string,
+  mayCompute = true,
+): Promise<RelatedReport | "not computed" | null> {
+  return priced(`related ${mint} ${wallet}`, () =>
+    relatedWalletsInner(mint, wallet, mayCompute),
+  );
+}
+
+async function relatedWalletsInner(
   mint: string,
   wallet: string,
   /**
@@ -1998,7 +3224,8 @@ export async function relatedWallets(
   const drawn = await stage("candles", () =>
     series(venue, mint, from, to, interval, sol),
   );
-  await remember(mint, interval, drawn.candles);
+  // The graph reads the subject's window, not the token's life.
+  await remember(mint, interval, drawn.candles, "window");
   const priceAt = priceLookup(drawn.candles);
 
   const graph = await stage("graph", () =>
@@ -2013,7 +3240,7 @@ export async function relatedWallets(
   const priced = await Promise.all(
     shortlist.map(async (related): Promise<RelatedWallet> => {
       const own = await walletActivity(mint, related.wallet);
-      const fills = await walletFills(own.txs, mint, related.wallet, priceAt);
+      const fills = await walletFills(own.txs, mint, related.wallet, priceAt, sol);
       const book = new PositionBook(Number.POSITIVE_INFINITY);
       for (const f of fills) {
         book.apply(mint, related.wallet, {

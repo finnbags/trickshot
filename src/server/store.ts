@@ -95,11 +95,117 @@ export async function loadBlob<T>(key: string): Promise<T | null> {
   }
 }
 
+/**
+ * How many keys one `id=in.(…)` may name.
+ *
+ * A URL, not a body — so the whole key list has to fit in one. The board hands
+ * this ~220 wallet addresses at a time, and `identity:` plus 44 base58
+ * characters times 220 is roughly 12KB of query string, past what the gateway
+ * in front of PostgREST accepts. Fifty keys is ~2.7KB, comfortably inside it,
+ * and the chunks run in parallel anyway.
+ */
+const READ_CHUNK = 50;
+
+/**
+ * Many blobs in one round trip.
+ *
+ * The board's identity lookup is the case that forced this: reading a cache of
+ * 220 wallets one `loadBlob` at a time is 220 sequential round trips to save
+ * three calls to Helius, which is worse than not caching at all.
+ */
+export async function loadBlobs<T>(keys: string[]): Promise<Map<string, T>> {
+  const found = new Map<string, T>();
+  const unique = [...new Set(keys)].filter(Boolean);
+  if (unique.length === 0) return found;
+
+  const remote = supabase();
+  if (remote) {
+    const chunks: string[][] = [];
+    for (let i = 0; i < unique.length; i += READ_CHUNK) {
+      chunks.push(unique.slice(i, i + READ_CHUNK));
+    }
+    const pages = await Promise.all(
+      chunks.map(async (chunk) => {
+        try {
+          const list = chunk.map((k) => `"${k.replace(/"/g, '\\"')}"`).join(",");
+          const res = await fetch(
+            `${remote.url}/rest/v1/${TABLE}?id=in.(${encodeURIComponent(list)})&select=id,payload`,
+            {
+              headers: { apikey: remote.key, authorization: `Bearer ${remote.key}` },
+              signal: AbortSignal.timeout(10_000),
+            },
+          );
+          if (!res.ok) return [];
+          return (await res.json()) as { id: string; payload: T }[];
+        } catch {
+          return [];
+        }
+      }),
+    );
+    for (const rows of pages) {
+      for (const row of rows) found.set(row.id, row.payload);
+    }
+    // As in `loadBlob`: Supabase answering is the answer. Disk is only for
+    // when it is absent or unreachable, never a second place to look.
+    return found;
+  }
+
+  await Promise.all(
+    unique.map(async (key) => {
+      const held = await loadBlob<T>(key);
+      if (held !== null) found.set(key, held);
+    }),
+  );
+  return found;
+}
+
+/**
+ * Many blobs in one write.
+ *
+ * PostgREST upserts an array body in a single call, so caching a batch of
+ * identities costs one request rather than one per address — which matters
+ * because the thing being cached only cost three requests to fetch.
+ */
+export async function saveBlobs(entries: { key: string; value: unknown }[]): Promise<void> {
+  if (entries.length === 0) return;
+  const remote = supabase();
+  if (remote) {
+    try {
+      const now = new Date().toISOString();
+      const res = await fetch(`${remote.url}/rest/v1/${TABLE}`, {
+        method: "POST",
+        headers: {
+          apikey: remote.key,
+          authorization: `Bearer ${remote.key}`,
+          "content-type": "application/json",
+          prefer: "resolution=merge-duplicates",
+        },
+        signal: AbortSignal.timeout(10_000),
+        body: JSON.stringify(
+          entries.map((e) => ({ id: e.key, payload: e.value, updated_at: now })),
+        ),
+      });
+      if (!res.ok) {
+        console.error(
+          `[store] batch write of ${entries.length} rejected: ${res.status} ${await res
+            .text()
+            .catch(() => "")}`,
+        );
+      }
+    } catch (error) {
+      console.error(`[store] batch write failed: ${(error as Error).message}`);
+    }
+    return;
+  }
+
+  await Promise.all(entries.map((e) => saveBlob(e.key, e.value)));
+}
+
 export async function saveBlob(key: string, value: unknown): Promise<void> {
   const remote = supabase();
   if (remote) {
     try {
-      await fetch(`${remote.url}/rest/v1/${TABLE}`, {
+      const res = await fetch(`${remote.url}/rest/v1/${TABLE}`, {
         method: "POST",
         headers: {
           apikey: remote.key,
@@ -116,8 +222,23 @@ export async function saveBlob(key: string, value: unknown): Promise<void> {
           updated_at: new Date().toISOString(),
         }),
       });
-    } catch {
-      // Best effort, as above.
+      /**
+       * A rejected write is reported, because it used to be invisible.
+       *
+       * Every failure in this file is swallowed on the grounds that a cache is
+       * a convenience — true for reads, and false for writes: a build that
+       * cost minutes and did not persist is not slower, it is lost, and the
+       * next request pays for it again. PostgREST answers a column it does not
+       * know with a 400, so a table created from an out-of-date DDL fails
+       * every single write while looking perfectly healthy.
+       */
+      if (!res.ok) {
+        console.error(
+          `[store] write of ${key} rejected: ${res.status} ${await res.text().catch(() => "")}`,
+        );
+      }
+    } catch (error) {
+      console.error(`[store] write of ${key} failed: ${(error as Error).message}`);
     }
   }
 
@@ -161,7 +282,8 @@ export const saveSeries = (series: Series) =>
  * Its own blob, and a tiny one, because it is read on the REQUEST path — every
  * wallet replay asks whether this mint can be zoomed. Deriving it from the
  * fine series instead means pulling that whole series to look at its first and
- * last bar: MEASURED, 1.18MB for five days of one-minute bars.
+ * last bar: MEASURED, 1.18MB for five days of one-minute bars, and 6.8MB had
+ * it covered the token's life. A hundred bytes answers the same question.
  */
 export interface ZoomIndex {
   mint: string;
@@ -255,12 +377,102 @@ export interface BuiltToken {
   /** Swaps on the charted book over its life. */
   swaps: number;
   builtAt: number;
+  /**
+   * How much of the token this chart actually covers.
+   *
+   * `full` is the mint-only rebuild: the whole life, at one bar width. Any
+   * wallet replay produces `window` — one wallet's slice, padded, and nothing
+   * either side of it. Both are legitimate charts and they are not
+   * interchangeable, so the gallery shows only `full` and the wallet pages may
+   * show either. Without the distinction, letting visitors build turns the
+   * home page into a list of half-drawn tokens.
+   *
+   * Optional so a row written before this existed reads back as `undefined`
+   * rather than a wrong answer; treat that as `full`, since every such row was
+   * written by the owner running the indexer.
+   */
+  coverage?: Coverage;
+}
+
+export type Coverage = "window" | "full";
+
+/** `full` always wins. A slice never demotes a whole-life chart. */
+function mergeCoverage(a?: Coverage, b?: Coverage): Coverage {
+  return a === "full" || b === "full" ? "full" : "window";
 }
 
 const INDEX_KEY = "index:tokens";
-const INDEX_MAX = Number(process.env.TRICKSHOT_INDEX_MAX ?? 60);
+/**
+ * Whole-life charts kept. These are the gallery.
+ *
+ * Each one cost a deliberate act — the owner running the indexer — so they are
+ * never evicted to make room for a visitor's wallet window.
+ */
+const INDEX_MAX = Number(process.env.TRICKSHOT_INDEX_MAX ?? 200);
+/**
+ * Wallet windows kept, over and above those.
+ *
+ * Held in their own budget rather than sharing one list, because they arrive
+ * at a completely different rate: a `full` row appears when someone indexes a
+ * token, and a `window` row appears every time any visitor replays any wallet
+ * on any mint. Sharing a cap means the second kind evicts the first within an
+ * afternoon of traffic, and a `full` row falling out of the index is not a
+ * cosmetic loss — the token vanishes from the gallery while its series and
+ * board blobs stay behind, orphaned and unreachable.
+ */
+const WINDOW_MAX = Number(process.env.TRICKSHOT_WINDOW_MAX ?? 400);
 
+/** A table row as PostgREST returns it, snake_case and all. */
+interface TokenRow {
+  mint: string;
+  name?: string | null;
+  symbol?: string | null;
+  image?: string | null;
+  interval: number;
+  bars: number;
+  first_ts: number;
+  last_ts: number;
+  swaps: number;
+  coverage: Coverage;
+  built_at: number;
+}
+
+const fromRow = (r: TokenRow): BuiltToken => ({
+  mint: r.mint,
+  name: r.name ?? undefined,
+  symbol: r.symbol ?? undefined,
+  image: r.image ?? undefined,
+  interval: r.interval,
+  bars: r.bars,
+  firstTs: r.first_ts ?? 0,
+  lastTs: r.last_ts,
+  swaps: r.swaps,
+  coverage: r.coverage,
+  builtAt: r.built_at,
+});
+
+async function query(path: string): Promise<TokenRow[] | null> {
+  const remote = supabase();
+  if (!remote) return null;
+  try {
+    const res = await fetch(`${remote.url}/rest/v1/trickshot_tokens?${path}`, {
+      headers: { apikey: remote.key, authorization: `Bearer ${remote.key}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as TokenRow[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every known token. Prefer `galleryTokens` or `tokenRow` — this loads all of
+ * them, which is exactly the cost the table exists to avoid.
+ */
 export async function builtTokens(): Promise<BuiltToken[]> {
+  const rows = await query("select=*&order=built_at.desc&limit=1000");
+  if (rows) return rows.map(fromRow);
   return (await loadBlob<BuiltToken[]>(INDEX_KEY)) ?? [];
 }
 
@@ -276,7 +488,53 @@ export async function builtTokens(): Promise<BuiltToken[]> {
 export async function rememberToken(
   token: Partial<BuiltToken> & { mint: string },
 ): Promise<void> {
-  const held = await builtTokens();
+  /**
+   * One atomic upsert where this used to be read-modify-write.
+   *
+   * The old shape loaded the whole index, merged in JS and wrote it all back —
+   * so two builds finishing together lost one of each other's rows, and the
+   * loser vanished from the gallery while its series and board blobs stayed
+   * behind, orphaned and unreachable. Postgres merges column by column in one
+   * statement, which is both cheaper and impossible to race.
+   */
+  const remote = supabase();
+  if (remote) {
+    try {
+      const res = await fetch(`${remote.url}/rest/v1/rpc/trickshot_remember`, {
+        method: "POST",
+        headers: {
+          apikey: remote.key,
+          authorization: `Bearer ${remote.key}`,
+          "content-type": "application/json",
+        },
+        signal: AbortSignal.timeout(10_000),
+        body: JSON.stringify({
+          p_mint: token.mint,
+          p_name: token.name ?? null,
+          p_symbol: token.symbol ?? null,
+          p_image: token.image ?? null,
+          p_interval: token.interval ?? 0,
+          p_bars: token.bars ?? 0,
+          p_first_ts: token.firstTs ?? 0,
+          p_last_ts: token.lastTs ?? 0,
+          p_swaps: token.swaps ?? 0,
+          p_coverage: token.coverage ?? "window",
+          p_built_at: token.builtAt ?? 0,
+        }),
+      });
+      if (res.ok) return;
+      console.error(
+        res.status === 404
+          ? "[store] trickshot_remember is missing — run scripts/migrate.sql. Using the index blob until then."
+          : `[store] remember ${token.mint} rejected: ${res.status}`,
+      );
+    } catch (error) {
+      console.error(`[store] remember ${token.mint} failed: ${(error as Error).message}`);
+    }
+    // Falls through to the blob, so nothing is lost while the table is absent.
+  }
+
+  const held = (await loadBlob<BuiltToken[]>(INDEX_KEY)) ?? [];
   const existing = held.find((t) => t.mint === token.mint);
 
   const merged: BuiltToken = {
@@ -286,19 +544,50 @@ export async function rememberToken(
     image: token.image ?? existing?.image,
     interval: token.interval ?? existing?.interval ?? 0,
     bars: Math.max(token.bars ?? 0, existing?.bars ?? 0),
-    firstTs: Math.min(
-      token.firstTs || Infinity,
-      existing?.firstTs || Infinity,
-    ),
+    firstTs: Math.min(token.firstTs || Infinity, existing?.firstTs || Infinity),
     lastTs: Math.max(token.lastTs ?? 0, existing?.lastTs ?? 0),
     swaps: Math.max(token.swaps ?? 0, existing?.swaps ?? 0),
     builtAt: token.builtAt ?? existing?.builtAt ?? 0,
   };
   if (!Number.isFinite(merged.firstTs)) merged.firstTs = 0;
-
-  const next = [merged, ...held.filter((t) => t.mint !== token.mint)].slice(
-    0,
-    INDEX_MAX,
+  merged.coverage = mergeCoverage(
+    token.coverage,
+    existing ? (existing.coverage ?? "full") : undefined,
   );
-  await saveBlob(INDEX_KEY, next);
+
+  const rest = held.filter((t) => t.mint !== token.mint);
+  const ordered = [merged, ...rest];
+  const full = ordered.filter((t) => (t.coverage ?? "full") === "full").slice(0, INDEX_MAX);
+  const windows = ordered
+    .filter((t) => (t.coverage ?? "full") === "window")
+    .slice(0, WINDOW_MAX);
+  await saveBlob(INDEX_KEY, [...full, ...windows]);
+}
+
+/**
+ * What the gallery shows: whole-life charts only, newest first.
+ *
+ * A LIMIT where it used to be "load every row and slice", which is the
+ * difference between a fixed cost and one that grows with the catalogue.
+ */
+export async function galleryTokens(limit = INDEX_MAX): Promise<BuiltToken[]> {
+  const rows = await query(
+    `select=*&coverage=eq.full&order=built_at.desc&limit=${limit}`,
+  );
+  if (rows) return rows.map(fromRow);
+  const all = await loadBlob<BuiltToken[]>(INDEX_KEY);
+  return (all ?? []).filter((t) => (t.coverage ?? "full") === "full").slice(0, limit);
+}
+
+/**
+ * One row, without reading the rest.
+ *
+ * The hot one: every request that names a mint asks this, and on the blob it
+ * meant fetching the whole index to answer a question about a single token.
+ */
+export async function tokenRow(mint: string): Promise<BuiltToken | null> {
+  const rows = await query(`select=*&mint=eq.${encodeURIComponent(mint)}&limit=1`);
+  if (rows) return rows[0] ? fromRow(rows[0]) : null;
+  const all = await loadBlob<BuiltToken[]>(INDEX_KEY);
+  return (all ?? []).find((t) => t.mint === mint) ?? null;
 }

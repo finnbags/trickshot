@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { readOnly } from "@/server/config";
+import { owner } from "@/server/config";
 import { relatedWallets } from "@/server/history";
 
 /**
@@ -35,7 +35,15 @@ export async function GET(request: Request) {
      * wallet and computes its graph, and every visitor then sees it. Asking
      * for one that was never computed says so rather than building it.
      */
-    const report = await relatedWallets(mint, wallet, !readOnly());
+    /**
+     * `owner(request)`, not `!readOnly()`.
+     *
+     * The old spelling granted this to everyone the moment the read-only flag
+     * came off — and working out a graph reads the subject's history plus up
+     * to eight linked wallets in full, which is thousands of credits and tens
+     * of seconds per request, on an endpoint anyone can call.
+     */
+    const report = await relatedWallets(mint, wallet, owner(request));
     if (report === "not computed") {
       return NextResponse.json(
         { error: "linked wallets have not been worked out for this wallet" },

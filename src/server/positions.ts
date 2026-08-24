@@ -68,6 +68,17 @@ export interface Position {
    */
   unknownBase: number;
   unknownUsd: number;
+  /**
+   * Unpriced tokens the wallet STILL HOLDS, as opposed to `unknownBase`, which
+   * is the lifetime total and never comes down.
+   *
+   * Both are needed and they answer different questions. The lifetime figure
+   * says how much of this wallet's story is unexplained, which is the flag.
+   * This one says how much of what it holds right now must be left out of the
+   * mark — because marking a gift to market is how a wallet handed 32.2M
+   * tokens ranks as the biggest winner on the board.
+   */
+  unknownHeld: number;
   fills: Fill[];
 }
 
@@ -100,6 +111,25 @@ export interface PnlRow {
    */
   heldSec: number;
   unknownBasis: boolean;
+  /**
+   * Tokens held that were never bought, and what they would be worth.
+   *
+   * Deliberately NOT folded into `total`. The row stays on the board and the
+   * reader gets to see both — "made $40,000, and also holds 32.2M tokens it
+   * never paid for" is the honest sentence, where dropping the wallet outright
+   * hid it and marking the gift inflated it.
+   */
+  unpricedBase: number;
+  unpricedValue: number;
+  /**
+   * Tokens this wallet was ever HANDED, over its whole life.
+   *
+   * Distinct from `unpricedBase`, which is only what it still holds. A minter
+   * that received the entire supply and passed it on holds nothing today, so
+   * the held figure says nothing about it — this one says it moved 100% of the
+   * token. That is what tells infrastructure apart from a trader.
+   */
+  receivedBase: number;
   /** |cash-flow total − (realized+unrealized)|. Should be ~0. */
   basisDrift: number;
 }
@@ -225,6 +255,7 @@ export class PositionBook {
         lastTs: fill.ts,
         unknownBase: 0,
         unknownUsd: 0,
+        unknownHeld: 0,
         fills: [],
       };
       wallets.set(wallet, p);
@@ -244,11 +275,50 @@ export class PositionBook {
       if (fill.isBuy) {
         p.qty += fill.base;
         p.unknownBase += fill.base;
+        p.unknownHeld += fill.base;
       } else {
         const sent = Math.min(fill.base, p.qty);
         if (sent > 0 && p.qty > 0) {
-          p.costBasis -= (p.costBasis / p.qty) * sent;
+          /**
+           * Tokens leaving are booked as an EXIT at the prevailing price.
+           *
+           * Nothing on chain says what happened next — a deposit to an
+           * exchange, a move to another wallet, a burn all look identical —
+           * and the two defensible readings are "we do not know" and "assume
+           * they sold". This is the second: an exchange deposit is
+           * overwhelmingly a prelude to selling, and treating it as nothing
+           * left the buy standing as a pure loss. MEASURED, that is where the
+           * whole board went wrong: `A3ZcnXcC` bought $26m of TRUMP, sent
+           * every token to an exchange, and read as a $26m loser.
+           *
+           * The cost of this choice, and it is real: if the tokens went to
+           * ANOTHER WALLET THE SAME PERSON OWNS, this books a sale that never
+           * happened — and if that wallet is also on the board, the position
+           * is counted twice. `graph.ts` already finds linked wallets; netting
+           * them out before this runs is the upgrade path.
+           *
+           * ponytail: assumes an exchange deposit is a sale. Ceiling is
+           * wallet-to-wallet moves by one owner; fix by merging linked
+           * wallets from `relatedWallets` before folding fills.
+           */
+          const avgCost = p.costBasis / p.qty;
+          const proceeds = fill.usd * (sent / fill.base);
+          // Handed-over tokens leaving again are not profit; same split the
+          // sell path uses.
+          const giftSent = (p.unknownHeld / p.qty) * sent;
+          const giftUsd = giftSent > 0 ? proceeds * (giftSent / sent) : 0;
+          p.unknownUsd += giftUsd;
+          p.cash += proceeds;
+          p.realized += proceeds - avgCost * sent - giftUsd;
+          p.unknownHeld -= giftSent;
+          p.costBasis -= avgCost * sent;
           p.qty -= sent;
+          /**
+           * `sells`, `soldUsd` and `soldBase` are deliberately NOT touched.
+           * Those describe trades the wallet actually made, and they feed the
+           * trade count and the average sell price on the board. An assumed
+           * exit is not a fill and must not appear as one.
+           */
         }
       }
       return;
@@ -274,7 +344,27 @@ export class PositionBook {
     if (sold > 0) {
       const avgCost = p.costBasis / p.qty;
       const proceeds = fill.usd * (sold / fill.base);
-      p.realized += proceeds - avgCost * sold;
+      /**
+       * The share of this sell that was never paid for, and its proceeds.
+       *
+       * The `unmatched` branch below only fires when a sell EXCEEDS the
+       * position — a wallet selling out of thin air. It cannot see the far
+       * more common shape: tokens arrive as a tracked transfer first, so `qty`
+       * is positive, `sold` covers the whole fill, and the proceeds book as
+       * pure profit against a zero basis. MEASURED on MELANIA, `BgKsDTAT`
+       * bought nothing, sold $45,232,141, and ranked fifth on the board; the
+       * three above it sold three to four times more than they ever bought.
+       *
+       * Taken off `realized` as well as recorded, so the two accountings still
+       * agree — `basisDrift` is only worth reading if both sides exclude the
+       * same money.
+       */
+      const giftSold = (p.unknownHeld / p.qty) * sold;
+      const giftUsd = giftSold > 0 ? proceeds * (giftSold / sold) : 0;
+      p.unknownUsd += giftUsd;
+      p.realized += proceeds - avgCost * sold - giftUsd;
+      // Selling draws on the same proportional mix a transfer out does.
+      p.unknownHeld -= giftSold;
       p.costBasis -= avgCost * sold;
       p.qty -= sold;
     }
@@ -302,9 +392,43 @@ export class PositionBook {
     const rows: PnlRow[] = [];
     for (const p of wallets.values()) {
       const unknown = unknownBasis(p);
-      if (unknown && !includeUnknownBasis) continue;
-      const unrealized = p.qty * price - p.costBasis;
-      const total = p.cash + p.qty * price;
+      /**
+       * Kept on the board, and marked only on what it actually paid for.
+       *
+       * This used to `continue` — and on a token where people move size
+       * through exchanges that threw most of the board away: MEASURED on
+       * TRUMP, 171 of 195 positions were discarded by this line and the
+       * "biggest winners" list came back with fifteen rows. The wallets it
+       * removed were disproportionately the ones worth showing, because a
+       * trader big enough to matter is a trader who has touched a CEX.
+       *
+       * The filter's own reason still stands: a wallet handed 32.2M tokens
+       * must not rank on the market value of the gift. So the gift is excluded
+       * from the MARK instead of the wallet being excluded from the board.
+       * `cash` is already pure — transfers never touch it — so a wallet that
+       * bought nothing and sold nothing now ranks at ~$0 rather than at
+       * +$4.66M, and one that genuinely traded keeps its real number.
+       */
+      const priced = Math.max(0, p.qty - p.unknownHeld);
+      const unrealized = priced * price - p.costBasis;
+      /**
+       * `unknownUsd` comes back OUT of the cash flow.
+       *
+       * `cash` counts every dollar a sell brought in, including sells of
+       * tokens that were never bought — and those proceeds are not profit,
+       * they are the value of a gift being realised. MEASURED on MELANIA,
+       * `BgKsDTAT` bought nothing, sold $45,232,141, and ranked fifth.
+       *
+       * Excluding the gift from the MARK, which is what `priced` does, cannot
+       * catch this: by the time the board is drawn the wallet holds nothing to
+       * mark. The two together are what make a handed-over position rank at
+       * zero whether it is still held or already sold.
+       */
+      const total = p.cash - p.unknownUsd + priced * price;
+      if (unknown && !includeUnknownBasis && total === 0 && p.realized === 0) {
+        // Nothing bought, nothing sold, only tokens handed over. No story.
+        continue;
+      }
       rows.push({
         wallet: p.wallet,
         qty: p.qty,
@@ -318,6 +442,9 @@ export class PositionBook {
         trades: p.buys + p.sells,
         heldSec: heldFor(p),
         unknownBasis: unknown,
+        unpricedBase: p.unknownHeld,
+        unpricedValue: p.unknownHeld * price,
+        receivedBase: p.unknownBase,
         basisDrift: Math.abs(total - (p.realized + unrealized)),
       });
     }
@@ -344,11 +471,14 @@ export class PositionBook {
         avgBuyPrice: p.boughtBase > 0 ? p.boughtUsd / p.boughtBase : 0,
         avgSellPrice: p.soldBase > 0 ? p.soldUsd / p.soldBase : 0,
         realized: p.realized,
-        unrealized: p.qty * price - p.costBasis,
-        total: p.cash + p.qty * price,
+        unrealized: Math.max(0, p.qty - p.unknownHeld) * price - p.costBasis,
+        total: p.cash + Math.max(0, p.qty - p.unknownHeld) * price,
         trades: p.buys + p.sells,
         heldSec: heldFor(p),
         unknownBasis: unknownBasis(p),
+        unpricedBase: p.unknownHeld,
+        unpricedValue: p.unknownHeld * price,
+        receivedBase: p.unknownBase,
         basisDrift: 0,
       }))
       .sort((a, b) => b.qty - a.qty)
@@ -437,6 +567,30 @@ export class PositionBook {
       const cutoff = minutes[k + 1] ?? minute + intervalSec;
       while (i < fills.length && fills[i]!.ts < cutoff) {
         const f = fills[i]!;
+        /**
+         * Transfers move tokens, not money — exactly as `apply` books them.
+         *
+         * Without this branch a transfer is walked as an ordinary fill with
+         * `usd: 0`, and both directions lie: tokens arriving add quantity
+         * against no basis, so `qty * price - costBasis` reports their whole
+         * market value as gain, and tokens leaving book `0 - avgCost * sent`
+         * as a realized LOSS the size of the basis. The board already refuses
+         * to price these — see `unknownBase` — and the replay curve is the one
+         * place that still did.
+         */
+        if (f.kind === "transfer") {
+          if (f.isBuy) {
+            qty += f.base;
+          } else {
+            const sent = Math.min(f.base, qty);
+            if (sent > 0 && qty > 0) {
+              costBasis -= (costBasis / qty) * sent;
+              qty -= sent;
+            }
+          }
+          i += 1;
+          continue;
+        }
         if (f.isBuy) {
           qty += f.base;
           costBasis += f.usd;
@@ -614,7 +768,20 @@ export class PositionBook {
   restore(mint: string, stored: Record<string, StoredPosition>): void {
     const wallets = new Map<string, Position>();
     for (const [address, p] of Object.entries(stored)) {
-      wallets.set(address, { wallet: address, ...p, fills: [] });
+      wallets.set(address, {
+        wallet: address,
+        ...p,
+        /**
+         * Defaulted, because a book stored before this field existed has no
+         * value for it — and `unknownHeld / qty` on an undefined is NaN, which
+         * propagates silently through the mark and puts NaN on the board for
+         * every token indexed before this change. Falling back to the lifetime
+         * figure is the conservative read: it can only understate the mark, and
+         * it converges on the truth the moment the wallet is read again.
+         */
+        unknownHeld: p.unknownHeld ?? p.unknownBase ?? 0,
+        fills: [],
+      });
     }
     this.byMint.set(mint, wallets);
   }

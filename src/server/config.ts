@@ -39,3 +39,36 @@ export const config = {
     | "confirmed"
     | "finalized",
 };
+
+/**
+ * Whether this request carries the owner's token.
+ *
+ * Every guard in this app used to be spelled `!readOnly()`, which works only
+ * while the flag is on. The destination is a deployment that BUILDS — flag
+ * off, writable key — and at that moment each of those guards silently flips
+ * from denying to allowing: `?update=1` would re-read every ranked wallet for
+ * anyone who typed it, and `/api/related` would compute a graph on request.
+ *
+ * Permission therefore comes from something being present, not from a flag
+ * being absent. Absent or empty `TRICKSHOT_OWNER_TOKEN` means NOBODY is the
+ * owner over HTTP — which is the state of every current deployment and every
+ * checkout, so the safe answer is also the default. The indexer passes its
+ * capabilities in-process and never calls this, so it keeps working with no
+ * token configured at all.
+ */
+export function owner(request: Request): boolean {
+  const expected = process.env.TRICKSHOT_OWNER_TOKEN;
+  if (!expected) return false;
+
+  const header = request.headers.get("authorization") ?? "";
+  const offered = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (offered.length !== expected.length) return false;
+
+  // Constant time over equal-length strings, so a wrong token cannot be
+  // narrowed down by how long the comparison took.
+  let diff = 0;
+  for (let i = 0; i < expected.length; i += 1) {
+    diff |= expected.charCodeAt(i) ^ offered.charCodeAt(i);
+  }
+  return diff === 0;
+}

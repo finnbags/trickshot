@@ -5,7 +5,6 @@ import {
   barAt,
   fetchHistory,
   ZOOM_MAX_BARS,
-  fetchRelated,
   type RelatedReport,
   type Replay,
   type ReplayCandle,
@@ -463,7 +462,6 @@ export function WalletReplay({
   wallet,
   label,
   preloaded,
-  canCompute = false,
   onClose,
 }: {
   mint: string;
@@ -477,8 +475,6 @@ export function WalletReplay({
    * reconstruction a second time.
    */
   preloaded?: TokenHistory;
-  /** Linked wallets are worked out where writes are possible; read anywhere. */
-  canCompute?: boolean;
   onClose: () => void;
 }) {
   const [raw, setRaw] = useState<Replay | null>(null);
@@ -548,8 +544,12 @@ export function WalletReplay({
   const [tooLong, setTooLong] = useState<number | null>(null);
   /** Shows the frames as they are encoded, where the chart usually sits. */
   const previewRef = useRef<HTMLCanvasElement>(null);
-  /** The token's symbol, which only the exported frame shows. */
+  /** The token's symbol, shown in the header and drawn on exported frames. */
   const [ticker, setTicker] = useState("");
+  /** Why the chart is empty, when the reason is the site rather than the wallet. */
+  const [failure, setFailure] = useState<{ message: string; queued: boolean } | null>(
+    null,
+  );
   /**
    * What this browser can encode. Asked once, and asked ASYNCHRONOUSLY —
    * WebCodecs answers with a promise, so unlike the check this replaced there
@@ -581,9 +581,17 @@ export function WalletReplay({
    * it reads other wallets' histories, and a replay should not wait for that.
    */
   const [related, setRelated] = useState<RelatedReport | null>(null);
-  const [findingRelated, setFindingRelated] = useState(false);
   /** Null until asked; false when this wallet has no graph to show. */
-  const [hasGraph, setHasGraph] = useState<boolean | null>(null);
+  /**
+   * Never set any more — the control that fetched a graph has been removed.
+   *
+   * Kept as state rather than deleted with the panel below it, because that
+   * panel is also where a linked wallet is TICKED into the replay, and the
+   * cluster machinery (`folded`, `alongside`) hangs off it. Removing the
+   * display would quietly remove folding too, which is a bigger decision than
+   * taking a button off the controls row.
+   */
+  const [hasGraph] = useState<boolean | null>(null);
   const [folded, setFolded] = useState<Set<string>>(new Set());
   /** Which wallet the loaded data belongs to, so a cluster change is not
    *  mistaken for a wallet change. */
@@ -664,6 +672,17 @@ export function WalletReplay({
           );
     void load.then((h) => {
       if (cancelled) return;
+      /**
+       * Why it is empty, not just that it is.
+       *
+       * `shape` maps anything it does not understand to no candles, and the
+       * chart reads no candles as "not enough history yet" — which is a
+       * sentence about the WALLET. A refusal, a queued build and a rate limit
+       * are sentences about the SITE, and all three arrived here dressed as
+       * the first. MEASURED: a token being indexed answered 413 twice and the
+       * page said the wallet had barely traded.
+       */
+      setFailure(h?.error ? { message: h.error, queued: Boolean(h.queued) } : null);
       setRaw(toMarketCap(shape(h)));
       /**
        * Which token this is, for the exported frame to say.
@@ -1359,7 +1378,22 @@ export function WalletReplay({
       >
         <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div className="min-w-0">
-            <Label>Wallet replay</Label>
+            {/*
+              The ticker belongs on screen, not only in the export.
+              
+              The exported frame has always carried it, because a clip that
+              leaves the page has to say which token it is. On the page itself
+              it was left out on the grounds that the surrounding UI already
+              said — but the modal covers that UI, and once it is open the
+              chart is a wallet's PnL against bars with no name attached. Same
+              amber, same weight as the frame draws it, so a recording and the
+              thing being recorded agree.
+            */}
+            {ticker && (
+              <div className="font-mono text-[10.5px] leading-none font-bold tracking-[0.1em] text-amber">
+                {ticker}
+              </div>
+            )}
             {label && (
               <div className="mt-1.5 font-mono text-[18px] font-bold text-tx">
                 {label}
@@ -1491,7 +1525,24 @@ export function WalletReplay({
           </div>
         </div>
 
-        {data && total < 2 && (
+        {failure && (
+          <div className="py-10 text-center">
+            <p
+              className={cx(
+                "font-mono text-[11px] tracking-[0.12em] uppercase",
+                failure.queued ? "text-amber" : "text-signal",
+              )}
+            >
+              {failure.queued ? "building this replay" : "could not draw this replay"}
+            </p>
+            <p className="mx-auto mt-2 max-w-[46ch] font-mono text-[11px] normal-case text-tx3">
+              {failure.message}
+              {failure.queued && " — reopen this wallet in a minute or two."}
+            </p>
+          </div>
+        )}
+
+        {!failure && data && total < 2 && (
           <p className="py-10 text-center font-mono text-[11px] tracking-[0.12em] text-tx3 uppercase">
             not enough history yet
           </p>
@@ -1571,29 +1622,6 @@ export function WalletReplay({
           >
             {playing ? "pause" : "play"}
           </button>
-          {!related && hasGraph !== false && (
-            <button
-              type="button"
-              onClick={() => {
-                setFindingRelated(true);
-                void fetchRelated(mint, wallet)
-                  .then((r) => {
-                    // A 404 means nobody has worked this wallet out yet.
-                    if (r?.error && !r.linked) setHasGraph(false);
-                    else setRelated(r);
-                  })
-                  .finally(() => setFindingRelated(false));
-              }}
-              disabled={findingRelated || locked}
-              className="cursor-pointer rounded-xs border border-line-strong px-2.5 py-1.5 font-mono text-[10px] tracking-[0.1em] text-tx2 uppercase hover:text-tx disabled:opacity-40"
-            >
-              {findingRelated
-                ? "looking…"
-                : canCompute
-                  ? "find linked wallets"
-                  : "show linked wallets"}
-            </button>
-          )}
           {SPEEDS.map((s) => (
             <button
               key={s}
@@ -1913,15 +1941,8 @@ export function WalletReplay({
           </div>
         )}
 
-        {now && (related || findingRelated || hasGraph === false) && (
+        {now && (related || hasGraph === false) && (
           <div className="mt-4 border-t border-line pt-4">
-            {findingRelated && (
-              <p className="mt-2 font-mono text-[11px] text-tx3">
-                {canCompute
-                  ? "Reading who this wallet moved tokens and SOL with, then reading each of them in full."
-                  : "Loading."}
-              </p>
-            )}
             {hasGraph === false && (
               /**
                * The honest empty state. Linked wallets are worked out one

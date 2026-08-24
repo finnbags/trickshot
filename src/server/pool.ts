@@ -1,5 +1,7 @@
 import { isProgramDerived } from "./address";
 import { config } from "./config";
+import { take } from "./limit";
+import { chargeRpc } from "./meter";
 import { WSOL_MINT } from "./mints";
 
 /**
@@ -41,6 +43,7 @@ export interface Venue {
  */
 async function rpc<T>(method: string, params: unknown): Promise<T | null> {
   try {
+    await take();
     const res = await fetch(config.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -49,6 +52,7 @@ async function rpc<T>(method: string, params: unknown): Promise<T | null> {
     });
     if (!res.ok) return null;
     const body = (await res.json()) as { result?: T };
+    chargeRpc(method, params, body.result);
     return body.result ?? null;
   } catch {
     return null;

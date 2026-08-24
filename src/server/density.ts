@@ -1,4 +1,6 @@
 import { config } from "./config";
+import { take } from "./limit";
+import { charge } from "./meter";
 import { tradeFilter } from "./pool";
 
 /**
@@ -34,6 +36,7 @@ async function probe(
   from: number,
 ): Promise<{ t: number; rate: number }> {
   try {
+    await take();
     const res = await fetch(config.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -58,6 +61,7 @@ async function probe(
     const body = (await res.json()) as {
       result?: { data?: { blockTime?: number }[] };
     };
+    charge({ kind: "signatures" });
     const data = body.result?.data ?? [];
     if (data.length < 2) return { t: from, rate: 0 };
     const span = (data[data.length - 1]?.blockTime ?? 0) - (data[0]?.blockTime ?? 0);
@@ -139,7 +143,8 @@ export async function countSwaps(
 
   for (let page = 0; page <= Math.ceil(ceiling / 1_000); page += 1) {
     try {
-      const res = await fetch(config.rpcUrl, {
+      await take();
+    const res = await fetch(config.rpcUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
         signal: AbortSignal.timeout(20_000),
@@ -164,6 +169,7 @@ export async function countSwaps(
       const body = (await res.json()) as {
         result?: { data?: unknown[]; paginationToken?: string };
       };
+      charge({ kind: "signatures" });
       const data = body.result?.data ?? [];
       count += data.length;
       token = body.result?.paginationToken;

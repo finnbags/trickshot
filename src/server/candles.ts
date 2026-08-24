@@ -1,4 +1,6 @@
 import { config } from "./config";
+import { pool, take } from "./limit";
+import { charge } from "./meter";
 import { countSwaps, expectedSwaps, type Density } from "./density";
 import { accountKeys, tradeFilter, type TokenBalanceRow, type Venue } from "./pool";
 import { QUOTE_MINTS, WSOL_MINT } from "./mints";
@@ -61,7 +63,7 @@ const PER_SUB = 2;
  * k=2 row: it recovered 2% of the range on a busy bar and drew the rest as a
  * flat body. Eight sub-windows at two transactions each lands on the knee.
  */
-const SUBS = Number(process.env.HISTORY_SUBS ?? 8);
+export const SUBS = Number(process.env.HISTORY_SUBS ?? 8);
 /**
  * Requests in flight, across every bar at once.
  *
@@ -78,7 +80,7 @@ const CONCURRENCY = Number(process.env.HISTORY_CONCURRENCY ?? 64);
  * endpoint averages ~20KB, so three thousand of them is already 60MB to
  * transfer and parse inside one request. Past that the window is sampled.
  */
-const EXACT_MAX = Number(process.env.HISTORY_EXACT_MAX ?? 1_200);
+export const EXACT_MAX = Number(process.env.HISTORY_EXACT_MAX ?? 1_200);
 /**
  * Swaps a single BAR may hold and still be read whole.
  *
@@ -87,7 +89,7 @@ const EXACT_MAX = Number(process.env.HISTORY_EXACT_MAX ?? 1_200);
  * high, low and volume rather than an estimated one. Held below the page limit
  * so that a bucket the density map underestimated still fits.
  */
-const EXACT_BUCKET = Number(process.env.HISTORY_EXACT_BUCKET ?? 40);
+export const EXACT_BUCKET = Number(process.env.HISTORY_EXACT_BUCKET ?? 40);
 
 export interface Swap {
   ts: number;
@@ -135,6 +137,7 @@ async function read(
   },
 ): Promise<{ data: RawTx[]; paginationToken?: string; ok: boolean }> {
   try {
+    await take();
     const res = await fetch(config.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -169,6 +172,7 @@ async function read(
      * cache what it could not read.
      */
     if (body.error) return { data: [], ok: false };
+    charge({ kind: "archive", returned: body.result?.data?.length ?? 0 });
     return {
       data: body.result?.data ?? [],
       paginationToken: body.result?.paginationToken,
@@ -306,9 +310,8 @@ function toCandles(
    * bar needs a price to be flat at. That is right at the very start of a
    * token and wrong everywhere else — and it is what made a hole in a cached
    * series permanent: the gap is refetched, the minute really did have no
-   * trades, no bar is produced, so the gap is still a gap the next time.
-   * Seeded with the last known close, a quiet minute becomes the flat bar it
-   * was.
+   * trades, no bar is produced, so the gap is still a gap the next time. Seeded
+   * with the last known close, a quiet minute becomes the flat bar it was.
    */
   seed = 0,
 ): Candle[] {
@@ -356,22 +359,6 @@ function toCandles(
     });
     last = close;
   }
-  return out;
-}
-
-async function pool<T>(jobs: (() => Promise<T>)[], limit: number): Promise<T[]> {
-  const out: T[] = new Array(jobs.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, jobs.length) }, async () => {
-    for (;;) {
-      const i = next;
-      next += 1;
-      const job = jobs[i];
-      if (!job) return;
-      out[i] = await job();
-    }
-  });
-  await Promise.all(workers);
   return out;
 }
 
@@ -666,19 +653,20 @@ export async function buildCandles(
 
   await sweep(buckets);
 
+  /**
+   * How many empty bars in a row it takes to be worth questioning at all.
+   *
+   * One is not evidence. A token trading a hundred a minute still has minutes
+   * with none, and the density map is probed too coarsely to know which — so
+   * at one-minute bars a single empty bucket is Tuesday, not a failure.
+   */
+  const BARREN_RUN = 3;
+
   /** A read that came back with nothing where the density expected trades. */
   const barren = (t: number) =>
     (found.get(t) ?? 0) === 0 && expectedSwaps(density, t, t + interval) >= 4;
 
-  /**
-   * Barren buckets, grouped into the consecutive runs they form.
-   *
-   * Grouped for the sake of the check below, which costs the same for a run of
-   * one bucket as for a run of two hundred — not because a longer run is more
-   * suspicious. EVERY barren bucket is checked: a single one is exactly the
-   * case that used to slip through, and it is also the commonest, since a
-   * cached series is refetched one bar at a time.
-   */
+  /** Consecutive barren buckets, in runs long enough to be worth checking. */
   const barrenRuns = (): number[][] => {
     const runs: number[][] = [];
     for (let i = 0; i < buckets.length; ) {
@@ -688,7 +676,7 @@ export async function buildCandles(
       }
       let j = i;
       while (j < buckets.length && barren(buckets[j] as number)) j += 1;
-      runs.push(buckets.slice(i, j));
+      if (j - i >= BARREN_RUN) runs.push(buckets.slice(i, j));
       i = j;
     }
     return runs;
@@ -708,17 +696,10 @@ export async function buildCandles(
    * trades meant unresolved, and unresolved bars are deliberately kept out of
    * the cache so the next request tries again. That is right when the read
    * failed and wrong when the market was simply quiet — and at one-minute bars
-   * quiet is common. MEASURED across eight indexed tokens, guessing split five
-   * contiguous days into as many as fifty-one ranges, each break a stretch
-   * that genuinely had no trades and could therefore never be filled in,
-   * however many times it was refetched.
-   *
-   * The check has to cover a run of ONE, which is the case a threshold would
-   * miss and the commonest of all: a warm series refetches only its newest
-   * bar, so a read that quietly comes back empty there is a single barren
-   * bucket. Left unchecked it is now WRITTEN — as a flat bar, seeded from the
-   * previous close — over whatever the cache held, and a bar invented that way
-   * is worse than the hole this mechanism used to leave.
+   * quiet is common. MEASURED across the eight indexed tokens, guessing split
+   * five contiguous days into as many as fifty-one ranges, each break a
+   * stretch that genuinely had no trades and could therefore never be filled
+   * in, however many times it was refetched.
    *
    * SIGNATURES settle it for ten credits a run, whatever the run's length:
    * nothing there means nothing happened, and those bars are flat and true and
