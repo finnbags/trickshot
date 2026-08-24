@@ -52,6 +52,43 @@ export interface Replay {
   candles: ReplayCandle[];
   trades: ReplayTrade[];
   points: ReplayPoint[];
+  /**
+   * The stretch drawn at a finer width, when one was asked for. Its presence
+   * means `candles` is NOT evenly spaced — see `barAt`.
+   */
+  zoom?: { from: number; to: number; interval: number };
+  /** The stretch a section may be picked from, when the feature is on. */
+  zoomable?: { from: number; to: number; interval: number };
+}
+
+/**
+ * Fine bars one zoom section may hold. Mirrors ZOOM_MAX_BARS on the server,
+ * which is the one that actually refuses; this only greys the button out
+ * rather than letting someone press it and get the coarse chart back.
+ */
+export const ZOOM_MAX_BARS = 4_000;
+
+/**
+ * The index of the bar a moment falls in, FOUND rather than computed.
+ *
+ * `Math.floor(ts / interval)` is only a bar index while every bar is the same
+ * width, and a chart with a zoomed section spliced into it has two widths in
+ * one series. Every place that marks a trade on a bar goes through here, so
+ * none of them can quietly assume the even spacing that used to hold.
+ *
+ * Returns -1 for a moment before the first bar.
+ */
+export function barAt(candles: { t: number }[], ts: number): number {
+  if (candles.length === 0) return -1;
+  if (ts < (candles[0] as { t: number }).t) return -1;
+  let lo = 0;
+  let hi = candles.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if ((candles[mid] as { t: number }).t <= ts) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 /** A wallet's standing on a reconstructed token. */
@@ -90,6 +127,14 @@ export interface TokenHistory {
   exact?: boolean;
   /** True when the named wallet has more history than was read. */
   partial?: boolean;
+  /**
+   * The stretch of this chart drawn at a finer bar width, when one was asked
+   * for. Bars inside it are `zoom.interval` wide and the rest are `interval`,
+   * in one series — so nothing may bucket by dividing a timestamp.
+   */
+  zoom?: { from: number; to: number; interval: number };
+  /** The stretch a zoom section may be picked from. */
+  zoomable?: { from: number; to: number; interval: number };
   firstTs: number;
   lastTs: number;
   /** Present only when a wallet was named. */
@@ -128,10 +173,16 @@ export async function fetchHistory(
   lead = 300,
   /** Wallets replayed as one position with `wallet`. */
   alongside: string[] = [],
+  /** The stretch to draw at the finer bar width. See `TokenHistory.zoomable`. */
+  section?: { from: number; to: number },
 ): Promise<TokenHistory | null> {
   const query = new URLSearchParams({ mint, lead: String(lead) });
   if (wallet) query.set("wallet", wallet);
   if (alongside.length > 0) query.set("with", alongside.join(","));
+  if (section) {
+    query.set("zoomFrom", String(section.from));
+    query.set("zoomTo", String(section.to));
+  }
   const res = await fetch(`/api/history?${query}`, { cache: "no-store" });
   const body = (await res.json()) as TokenHistory;
   if (!res.ok) return { ...body, error: body.error ?? `error ${res.status}` };

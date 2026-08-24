@@ -31,6 +31,7 @@ import {
   builtTokens,
   loadBlob,
   loadSeries,
+  loadZoom,
   mergeCandles,
   missingRanges,
   rememberToken,
@@ -181,6 +182,14 @@ export interface TokenHistory {
   exact?: boolean;
   /** True when the named wallet has more history than was read. */
   partial?: boolean;
+  /**
+   * The stretch of this chart drawn at a finer bar width, when one was asked
+   * for. Bars inside it are `zoom.interval` wide and the rest are `interval`,
+   * in one series — so nothing may bucket by dividing a timestamp.
+   */
+  zoom?: { from: number; to: number; interval: number };
+  /** The stretch a zoom section may be picked from. See `zoomFor`. */
+  zoomable?: { from: number; to: number; interval: number };
   /** Every wallet in the replay, when more than the subject was asked for. */
   cluster?: string[];
   /** The named wallet's own identity, when Helius knows one. */
@@ -476,18 +485,58 @@ async function walletFills(
  * traded in a gap the chart does not cover is better priced approximately than
  * not at all.
  */
-function priceLookup(candles: Candle[], interval: number): (ts: number) => number {
+/**
+ * Several bars folded into one, for the part-bar at either edge of a section.
+ *
+ * Open from the first, close from the last, extremes and totals across all of
+ * them — a wider bar of the same trades. Returned as an array so the caller
+ * can splice it in whether or not there was anything to fold: an edge that
+ * lands exactly on a coarse boundary has no stub, and no bar should appear.
+ */
+function stub(bars: Candle[], t: number): Candle[] {
+  const first = bars[0];
+  const last = bars[bars.length - 1];
+  if (!first || !last) return [];
+  return [
+    {
+      t,
+      o: first.o,
+      h: Math.max(...bars.map((b) => b.h)),
+      l: Math.min(...bars.map((b) => b.l)),
+      c: last.c,
+      v: bars.reduce((n, b) => n + b.v, 0),
+      vb: bars.reduce((n, b) => n + b.vb, 0),
+      n: bars.reduce((n, b) => n + b.n, 0),
+    },
+  ];
+}
+
+function priceLookup(candles: Candle[]): (ts: number) => number {
   if (candles.length === 0) return () => 0;
-  const byBucket = new Map<number, number>();
-  for (const c of candles) byBucket.set(c.t, c.c);
   const first = candles[0] as Candle;
   const last = candles[candles.length - 1] as Candle;
 
   return (ts: number) => {
     if (ts <= first.t) return first.o;
     if (ts >= last.t) return last.c;
-    const bucket = Math.floor(ts / interval) * interval;
-    return byBucket.get(bucket) ?? last.c;
+    /**
+     * The bar is FOUND, not computed.
+     *
+     * `Math.floor(ts / interval)` assumes every bar is the same width, which
+     * stops being true the moment a finer section is spliced in: a fill inside
+     * the fine stretch would be asked for a two-hour bucket that holds no bar,
+     * miss, fall through to the series' last close, and book a trade from
+     * Tuesday at Friday's price. Searching the times that are actually there
+     * is right for both shapes.
+     */
+    let lo = 0;
+    let hi = candles.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if ((candles[mid] as Candle).t <= ts) lo = mid;
+      else hi = mid - 1;
+    }
+    return (candles[lo] as Candle).c;
   };
 }
 
@@ -658,6 +707,26 @@ async function poolLifespan(
 }
 
 /**
+ * The close of the latest bar before `t`, across every list that might hold it.
+ *
+ * Two lists because a build knows its bars from two places — the ones already
+ * cached and the ones it has produced for earlier gaps in this same call — and
+ * the bar immediately before a gap can be in either.
+ */
+function closeBefore(t: number, ...lists: Candle[][]): number {
+  let best: Candle | null = null;
+  for (const bars of lists) {
+    for (let i = bars.length - 1; i >= 0; i -= 1) {
+      const c = bars[i] as Candle;
+      if (c.t >= t) continue;
+      if (!best || c.t > best.t) best = c;
+      break;
+    }
+  }
+  return best?.c ?? 0;
+}
+
+/**
  * Candles for a window, served from the cache wherever it can be.
  *
  * A token's past does not move. Only the newest bar can still change — it was
@@ -712,6 +781,15 @@ async function series(
       Math.min(gap.to, nowSec()),
       Math.max(2, Math.min(bars, 40)),
     );
+    /**
+     * The last price known BEFORE this gap, handed to the builder.
+     *
+     * A gap that turns out to hold no trades produces no bars without it, so
+     * the gap survives the rebuild and is refetched for ever — which is how
+     * five contiguous days of one-minute bars came back as six ranges split by
+     * single quiet minutes.
+     */
+    const seed = closeBefore(gap.from, cached?.candles ?? [], fresh);
     const built = await buildCandles(
       venue,
       mint,
@@ -720,6 +798,7 @@ async function series(
       interval,
       sol,
       density,
+      seed,
     );
     if (!built.exact) exact = false;
     /**
@@ -1035,6 +1114,55 @@ async function nominate(
   return { candidates: candidates.slice(0, BOARD_CANDIDATES), considered: gross.size };
 }
 
+/**
+ * Bars a spliced section may hold. A backstop, not the real bound.
+ *
+ * The real bound is that a section is only offered over a stretch already
+ * built at the fine width — see `zoomable` — so the series call behind it is a
+ * cache read. This catches the case where that stretch is itself enormous:
+ * `buildCandles` holds every response of a sweep at once, and a few thousand
+ * bars of full transactions is gigabytes of them.
+ */
+const ZOOM_MAX_BARS = Number(process.env.ZOOM_MAX_BARS ?? 4_000);
+
+/** A stretch of the chart drawn at the finer width. Snapped by the caller. */
+export interface ZoomSection {
+  from: number;
+  to: number;
+}
+
+/**
+ * Whether this token has bars finer than its own chart, and how fine.
+ *
+ * Read from the index a build leaves behind rather than from configuration: a
+ * token is zoomable exactly when someone has run `scripts/zoom-window.mjs`
+ * over it, and there is nothing to switch on. That is also what bounds the
+ * cost — the section a caller may ask for is a slice of what is already
+ * stored, so it is a cache read however hard the slider is dragged.
+ */
+async function zoomFor(
+  mint: string,
+  /** The replay's own window, so the best-fitting range is the one offered. */
+  window: { from: number; to: number },
+) {
+  const index = await loadZoom(mint);
+  if (!index || !(index.interval > 0)) return null;
+  /**
+   * The range that overlaps this replay most, not merely the first one.
+   *
+   * A token built over two stretches has one that matters to any given wallet
+   * — usually the only one it traded in. Ties go to the later range, which is
+   * the one a fresh replay is more likely to be about.
+   */
+  let best: { from: number; to: number; overlap: number } | null = null;
+  for (const r of index.ranges ?? []) {
+    const overlap = Math.min(r.to, window.to) - Math.max(r.from, window.from);
+    if (overlap <= 0) continue;
+    if (!best || overlap >= best.overlap) best = { ...r, overlap };
+  }
+  return best ? { interval: index.interval, from: best.from, to: best.to } : null;
+}
+
 async function walletHistory(
   mint: string,
   wallet: string,
@@ -1049,6 +1177,8 @@ async function walletHistory(
    * other, so as one position it cancels exactly, the way it should.
    */
   alongside: string[] = [],
+  /** The stretch to draw finely, when the caller picked one. See `zoomFor`. */
+  section?: ZoomSection,
 ): Promise<TokenHistory | null> {
   const cluster = [wallet, ...alongside.filter((w) => w !== wallet)];
   const [activities, venue] = await Promise.all([
@@ -1099,7 +1229,82 @@ async function walletHistory(
 
   if (drawn.candles.length === 0) return null;
 
-  const priceAt = priceLookup(drawn.candles, interval);
+  /**
+   * One stretch of the chart at a finer bar width, spliced into the coarse one.
+   *
+   * Not a second chart and not a zoom of the first: the bars either side stay
+   * as wide as they were and the ones inside the section are minutes, in a
+   * single series that runs straight through. The replay steps one bar at a
+   * time, so the section plays out slowly while the rest of the token's life
+   * goes past at its usual width — which is the point, since a minute that
+   * moved 45% is one flat-looking bar on a two-hour chart.
+   *
+   * Offered ONLY over a stretch already built at the fine width. That is what
+   * keeps this from being a way to spend money by dragging a slider: the
+   * `series` call below is a cache read, not a build.
+   */
+  const fine = await zoomFor(mint, { from, to });
+  /**
+   * The stretch a section may be cut from, in COARSE bars.
+   *
+   * Snapped INWARD, which is the direction that matters: the edges of a
+   * section are filled from fine bars either side of it, so the usable range
+   * has to be one where the whole coarse bar containing each edge is itself
+   * covered at the fine width. Snapping outward would reach for minute bars
+   * that were never built and turn a slider drag into a build.
+   */
+  const covered = fine
+    ? {
+        from: Math.ceil(Math.max(fine.from, from) / interval) * interval,
+        to: Math.floor(Math.min(fine.to, to) / interval) * interval,
+      }
+    : null;
+
+  let candles = drawn.candles;
+  let exact = drawn.exact;
+  let zoomed: { from: number; to: number; interval: number } | undefined;
+
+  if (fine && covered && section && covered.to > covered.from) {
+    const zf = Math.min(Math.max(section.from, covered.from), covered.to);
+    const zt = Math.min(Math.max(section.to, zf), covered.to);
+    /**
+     * The coarse bars the two edges land inside.
+     *
+     * A section that starts at 02:37 sits in the middle of the 02:00 bar. That
+     * bar cannot stay — it covers ground the minute bars are about to cover
+     * again, and a bar drawn twice is volume counted twice — and it cannot
+     * simply go either, because dropping it leaves 02:00 to 02:37 with no bar
+     * at all. So it is REBUILT from the fine bars of just that stub, and the
+     * same at the far end. That is what lets a section begin and end on a
+     * minute instead of being widened to the nearest coarse boundary.
+     */
+    const head = Math.floor(zf / interval) * interval;
+    const tail = Math.ceil(zt / interval) * interval;
+    const bars = (tail - head) / fine.interval;
+    if (zt > zf && bars <= ZOOM_MAX_BARS) {
+      const inner = await stage("candles:zoom", () =>
+        series(venue, mint, head, tail, fine.interval, sol),
+      );
+      const within = (lo: number, hi: number) =>
+        inner.candles.filter((c) => c.t >= lo && c.t < hi);
+      const body = within(zf, zt);
+      if (body.length > 0) {
+        candles = [
+          ...drawn.candles.filter((c) => c.t < head),
+          ...stub(within(head, zf), head),
+          ...body,
+          ...stub(within(zt, tail), zt),
+          ...drawn.candles.filter((c) => c.t >= tail),
+        ];
+        if (!inner.exact) exact = false;
+        zoomed = { from: zf, to: zt, interval: fine.interval };
+      }
+    } else if (bars > ZOOM_MAX_BARS) {
+      console.warn(`[zoom] refused ${Math.round(bars)} bars, over ${ZOOM_MAX_BARS}`);
+    }
+  }
+
+  const priceAt = priceLookup(candles);
   const perWallet = await Promise.all(
     cluster.map((w, i) =>
       walletFills(
@@ -1138,6 +1343,8 @@ async function walletHistory(
     tokenSupply(mint),
   ]);
 
+  // The COARSE series is what the token is remembered by; the spliced one is
+  // this request's view of it.
   await remember(mint, interval, drawn.candles, token);
 
   return {
@@ -1145,16 +1352,27 @@ async function walletHistory(
     cluster: cluster.length > 1 ? cluster : undefined,
     walletName,
     ...token,
-    candles: drawn.candles,
+    candles,
     supply,
     interval,
     fills: fills.length,
     transactions: activities.reduce((n, a) => n + a.txs.length, 0),
-    firstTs: drawn.candles[0]?.t ?? activity.first,
-    lastTs: drawn.candles[drawn.candles.length - 1]?.t ?? activity.last,
+    firstTs: candles[0]?.t ?? activity.first,
+    lastTs: candles[candles.length - 1]?.t ?? activity.last,
     venue: venue.pool,
-    exact: drawn.exact,
+    exact,
     partial: activity.truncated,
+    zoom: zoomed,
+    /**
+     * The stretch a section may be picked from, which is what the control
+     * under the chart is drawn against. Absent means nothing has been built at
+     * a finer width for this mint — so there is nothing to offer, and no
+     * control to show.
+     */
+    zoomable:
+      covered && covered.to > covered.from
+        ? { interval: (fine as { interval: number }).interval, ...covered }
+        : undefined,
   };
 }
 
@@ -1333,6 +1551,8 @@ export async function reconstruct(
   leadSec = 300,
   /** Extra wallets replayed as one position with it. See `walletHistory`. */
   alongside: string[] = [],
+  /** The stretch to draw at the finer bar width. See `zoomFor`. */
+  section?: ZoomSection,
 ): Promise<TokenHistory | null> {
   /**
    * A token is rebuilt ONCE. Replaying a second wallet on it then costs only
@@ -1349,7 +1569,7 @@ export async function reconstruct(
    * token's size — and the chart is drawn only for the window they span.
    */
   if (wallet) {
-    const quick = await walletHistory(mint, wallet, leadSec, alongside);
+    const quick = await walletHistory(mint, wallet, leadSec, alongside, section);
     if (quick) return quick;
   }
 
@@ -1493,7 +1713,7 @@ export async function traderBoard(
     (await series(venue, mint, life.first, Math.min(life.last, nowSec()) + interval, interval, sol))
       .candles;
   await remember(mint, interval, drawn);
-  const priceAt = priceLookup(drawn, interval);
+  const priceAt = priceLookup(drawn);
 
   /**
    * An update keeps the candidates it already has and only reads what is new.
@@ -1664,7 +1884,7 @@ export function replayFrom(
   if (!held) return null;
 
   const inCluster = new Set(cluster);
-  const trades = held.fills.filter((f) => f.wallet && inCluster.has(f.wallet));
+  const mine = held.fills.filter((f) => f.wallet && inCluster.has(f.wallet));
 
   /**
    * The run-up is counted in BARS, not seconds.
@@ -1679,12 +1899,23 @@ export function replayFrom(
    * by transfer are not the moment the story starts, and a wallet that was
    * airdropped dust weeks earlier would otherwise begin its replay there.
    */
-  const opening = trades.find((f) => f.kind !== "transfer") ?? trades[0];
+  const opening = mine.find((f) => f.kind !== "transfer") ?? mine[0];
   const firstTrade = opening?.ts ?? candles[0]?.t ?? 0;
-  const from =
+  /**
+   * Never before the first bar there is.
+   *
+   * The run-up is measured back from the wallet's first trade, and a replay
+   * whose chart starts later than that would otherwise open at a time the
+   * series does not reach, placing every marker in the stretch it does not
+   * draw at a bar that does not exist.
+   */
+  const from = Math.max(
     Math.floor(firstTrade / held.interval) * held.interval -
-    Math.max(leadSec, LEAD_BARS * held.interval);
+      Math.max(leadSec, LEAD_BARS * held.interval),
+    candles[0]?.t ?? 0,
+  );
   const window = candles.filter((c) => c.t >= from);
+  const trades = mine.filter((f) => f.ts >= from);
   const closes = new Map(window.map((c) => [c.t, c.c]));
 
   return {
@@ -1768,7 +1999,7 @@ export async function relatedWallets(
     series(venue, mint, from, to, interval, sol),
   );
   await remember(mint, interval, drawn.candles);
-  const priceAt = priceLookup(drawn.candles, interval);
+  const priceAt = priceLookup(drawn.candles);
 
   const graph = await stage("graph", () =>
     walletGraph(mint, wallet, activity.txs, { from, to }, adapt),

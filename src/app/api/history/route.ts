@@ -28,6 +28,17 @@ export async function GET(request: Request) {
     .map((w) => w.trim())
     .filter((w) => w && isAddress(w))
     .slice(0, 8);
+  /**
+   * The stretch to draw at the finer bar width, when the control under the
+   * chart picked one. Ignored unless finer bars are stored for this mint, and
+   * clamped there to the span that actually is — see `zoomFor`.
+   */
+  const zoomFrom = Number(searchParams.get("zoomFrom") ?? 0);
+  const zoomTo = Number(searchParams.get("zoomTo") ?? 0);
+  const section =
+    Number.isFinite(zoomFrom) && Number.isFinite(zoomTo) && zoomFrom > 0 && zoomTo > zoomFrom
+      ? { from: zoomFrom, to: zoomTo }
+      : undefined;
 
   if (!isAddress(mint)) {
     return NextResponse.json({ error: "a valid mint is required" }, { status: 400 });
@@ -51,7 +62,7 @@ export async function GET(request: Request) {
   }
 
   try {
-    const history = await reconstruct(mint, wallet, lead, alongside);
+    const history = await reconstruct(mint, wallet, lead, alongside, section);
     if (!history) {
       return NextResponse.json(
         { error: "no trades found for this mint" },
