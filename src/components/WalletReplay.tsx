@@ -6,13 +6,41 @@ import {
   fetchRelated,
   type RelatedReport,
   type Replay,
+  type ReplayCandle,
   type ReplayPoint,
   type TokenHistory,
 } from "@/lib/replay";
-import { usdCompact } from "@/lib/format";
-import { bestContainer, record, save } from "@/lib/record";
-import { captureTrack, play as playCue, prepare as prepareSound } from "@/lib/sound";
-import { Copy, cx, Label, useAutoPlay, useEffects, useStoredFlag } from "./ui";
+import { capLabel, usdCompact } from "@/lib/format";
+import { save } from "@/lib/record";
+import {
+  play as playCue,
+  prepare as prepareSound,
+  renderCues,
+  type Cued,
+} from "@/lib/sound";
+import {
+  DESIGN_W,
+  encode,
+  FORMATS,
+  FPS,
+  layoutFor,
+  MAX_CLIP_SECONDS,
+  negotiate,
+  OUTRO_SECONDS,
+  SHAPES,
+  type Encoders,
+  type Shape,
+} from "@/lib/clip";
+import { paint, type PaintFlash, type Totals } from "@/lib/frame";
+import {
+  Copy,
+  cx,
+  Label,
+  useAutoPlay,
+  useEffects,
+  useStoredFlag,
+  useStoredValue,
+} from "./ui";
 
 /**
  * One wallet's trades on one token, played back on the real chart.
@@ -120,13 +148,258 @@ interface Flash {
   phase: "enter" | "shown" | "out";
   /** When it appeared, so it can retire itself. */
   bornAt: number;
-  /** When it started leaving. The recorder fades from here. */
+  /** When it started leaving, so the fade can run from there. */
   outAt?: number;
 }
 
 let flashId = 0;
 /** How long a label holds before it leaves of its own accord. */
 const FLASH_MS = 1_400;
+
+/** Once per this much gained, the fanfare sounds. */
+const FANFARE_AT = 20_000;
+
+/** The handle onto the mounted chart. Held in a ref; see `api`. */
+interface ChartApi {
+  chart: {
+    remove(): void;
+    resize(width: number, height: number): void;
+    applyOptions(options: Record<string, unknown>): void;
+    timeScale(): { scrollToRealTime(): void };
+    /** A composed copy of the chart exactly as drawn — axes and all. */
+    takeScreenshot(): HTMLCanvasElement;
+  };
+  series: { setData(rows: unknown[]): void; update(row: unknown): void };
+  markers: { setMarkers(m: unknown[]): void } | null;
+  lwc: typeof import("lightweight-charts");
+  /** Index already painted into THIS series, so a step can append instead of
+   *  rebuilding. Lives on the handle because it is only meaningful for the
+   *  chart currently mounted — a mode switch builds a fresh, empty one. */
+  painted: number;
+}
+
+type Mark = { time: number };
+
+/** One label's worth of fills. */
+export interface Fill {
+  isBuy: boolean;
+  usd: number;
+  who?: string;
+}
+
+/**
+ * One bar's fills, summed the way a single label represents them.
+ *
+ * The unit here is the LABEL, not the trade: a router can put a dozen fills in
+ * one bar, and twelve numbers climbing the screen together says less than two
+ * do. Both the live view and the exporter read this, so neither can disagree
+ * with the other about what happened in a bar — re-deriving that on one side
+ * is exactly how an earlier exporter drifted away from the screen.
+ */
+function fillsInBar(data: Replay, bar: number, perWallet: boolean): Fill[] {
+  const candle = data.candles[bar];
+  if (!candle) return [];
+  const iv = data.interval;
+  const grouped = new Map<string, Fill>();
+  for (const t of data.trades) {
+    if (t.kind === "transfer" || !(t.usd > 0)) continue;
+    if (Math.floor(t.ts / iv) * iv !== candle.t) continue;
+    const who = perWallet ? (t.wallet ?? undefined) : undefined;
+    const key = `${t.isBuy}:${who ?? ""}`;
+    const held = grouped.get(key) ?? { isBuy: t.isBuy, usd: 0, who };
+    held.usd += t.usd;
+    grouped.set(key, held);
+  }
+  return [...grouped.values()];
+}
+
+/** Whether a bar sold anything, which is what the till rings for. */
+function soldInBar(data: Replay, bar: number): boolean {
+  const candle = data.candles[bar];
+  if (!candle) return false;
+  const iv = data.interval;
+  return data.trades.some(
+    (t) =>
+      t.kind !== "transfer" &&
+      !t.isBuy &&
+      t.usd > 0 &&
+      Math.floor(t.ts / iv) * iv === candle.t,
+  );
+}
+
+/**
+ * Every cue a clip will play, and when.
+ *
+ * The bar-zero case is the subtle one: the live view ARMS the fanfare at the
+ * opening bar without sounding it, so a wallet that is already up $80K when
+ * the replay starts does not open with four blasts. Seeding `tier` from the
+ * first point does the same thing here.
+ */
+function cueSchedule(data: Replay, stepMs: number): Cued[] {
+  const cues: Cued[] = [];
+  let tier = Math.max(Math.floor((data.points[0]?.total ?? 0) / FANFARE_AT), 0);
+  for (let bar = 0; bar < data.candles.length; bar += 1) {
+    const t = (bar * stepMs) / 1_000;
+    if (soldInBar(data, bar)) cues.push({ t, cue: "kaching" });
+    if (bar === 0) continue;
+    const reached = Math.floor((data.points[bar]?.total ?? 0) / FANFARE_AT);
+    if (reached > tier) {
+      tier = reached;
+      cues.push({ t, cue: "bandos" });
+    }
+  }
+  return cues;
+}
+
+function finishedRow(c: ReplayCandle, mode: Mode): unknown {
+  return mode === "candles"
+    ? { time: c.t, open: c.o, high: c.h, low: c.l, close: c.c }
+    : { time: c.t, value: c.c };
+}
+
+/**
+ * The bar being replayed, part-formed.
+ *
+ * Its close walks from the open toward the real close across the step, with
+ * the high and low revealed as it goes, exactly as a live candle behaves while
+ * trades land in it. Appending finished bars on a timer made the chart tick
+ * like a slideshow, which is the thing that read as unnatural.
+ */
+function formingRow(data: Replay, bar: number, p: number, mode: Mode): unknown {
+  const b = data.candles[bar];
+  const from = data.candles[bar - 1]?.c ?? b.o;
+  // Ease slightly: a linear walk looks mechanical at low speeds.
+  const eased = p * p * (3 - 2 * p);
+  const close =
+    mode === "candles" ? b.o + (b.c - b.o) * eased : from + (b.c - from) * eased;
+  return mode === "candles"
+    ? {
+        time: b.t,
+        open: b.o,
+        high: Math.max(b.o, close, b.o + (b.h - b.o) * eased),
+        low: Math.min(b.o, close, b.o + (b.l - b.o) * eased),
+        close,
+      }
+    : { time: b.t, value: close };
+}
+
+/**
+ * Put the chart exactly where a moment in the replay says it should be.
+ *
+ * The one place the series is written, called both by the live frame loop and
+ * by the exporter — so an export cannot drift from the screen, because it is
+ * not copying the screen, it is the same instruction.
+ *
+ * Everything structural sits behind `painted !== bar`. The exporter calls this
+ * thirty times a second with the same bar, and the guard it replaced (`painted
+ * !== bar - 1`, written for an effect that ran once per bar) would have
+ * rebuilt the entire history on every one of those frames.
+ */
+function seek(
+  a: ChartApi,
+  data: Replay,
+  marks: Mark[],
+  mode: Mode,
+  bar: number,
+  p: number,
+): void {
+  const candle = data.candles[bar];
+  if (!candle) return;
+
+  if (a.painted !== bar) {
+    // `bar > 0` guards the opening frame: `painted` starts at -1, so without
+    // it the append branch would take -1 === -1 and read candles[-1].
+    if (bar > 0 && a.painted === bar - 1) {
+      // The bar that was forming is finished history now; snap it to its close.
+      a.series.update(finishedRow(data.candles[bar - 1], mode));
+    } else {
+      a.series.setData(data.candles.slice(0, bar).map((c) => finishedRow(c, mode)));
+      a.chart.timeScale().scrollToRealTime();
+    }
+
+    const visible = marks.filter((m) => m.time <= candle.t);
+    if (a.markers) a.markers.setMarkers(visible);
+    else if (visible.length > 0) {
+      a.markers = a.lwc.createSeriesMarkers(
+        a.series as never,
+        visible as never,
+      ) as unknown as { setMarkers(m: unknown[]): void };
+    }
+
+    a.painted = bar;
+  }
+
+  a.series.update(formingRow(data, bar, p, mode));
+}
+
+/** Matches the CSS: 240ms in, hold, 240ms out. */
+const FADE_MS = 240;
+
+/**
+ * The colour wash, on the 900ms curve the `replay-wash` keyframe describes —
+ * up by 22%, down to nothing by the end. It rode the label's 240ms fade for a
+ * while, which made an exported wash a third the length of the screen's.
+ */
+function washAt(age: number): number {
+  if (age < 0 || age > 900) return 0;
+  return age < 198 ? age / 198 : 1 - (age - 198) / 702;
+}
+
+/**
+ * The labels floating over the chart at one moment of a clip.
+ *
+ * Time here is clip time, not the wall clock, which is the whole reason the
+ * exporter cannot reuse the live view's state. The displacement rule is the
+ * part that matters: a new fill pushes the previous one OUT rather than
+ * stacking on it, so only the most recent filled bar is ever fully on screen.
+ * Deriving this as "any fill within FLASH_MS" instead would pile eighteen bars
+ * of labels on top of each other at 8x, where the screen shows one.
+ */
+function flashesAtClip(
+  filled: { bar: number; at: number; fills: Fill[] }[],
+  cursor: number,
+  clipMs: number,
+  caps: number[],
+): PaintFlash[] {
+  const out: PaintFlash[] = [];
+  const live = filled[cursor];
+  if (!live) return out;
+
+  const push = (
+    group: { bar: number; at: number; fills: Fill[] },
+    leftAt: number | null,
+  ) => {
+    group.fills.forEach((f, slot) => {
+      const age = clipMs - group.at;
+      const alpha =
+        leftAt === null
+          ? Math.min(1, age / FADE_MS)
+          : Math.max(0, 1 - (clipMs - leftAt) / FADE_MS);
+      if (alpha <= 0) return;
+      out.push({
+        isBuy: f.isBuy,
+        usd: f.usd,
+        cap: caps[group.bar] ?? 0,
+        slot,
+        who: f.who,
+        alpha,
+        // The DOM renders a wash only for flashes that are not on their way
+        // out, so an outgoing one glows nowhere.
+        wash: leftAt === null ? washAt(age) : 0,
+        out: leftAt !== null,
+      });
+    });
+  };
+
+  // Its time ran out with no later fill to displace it.
+  const expired = clipMs - live.at > FLASH_MS;
+  push(live, expired ? live.at + FLASH_MS : null);
+
+  const before = filled[cursor - 1];
+  if (before) push(before, live.at);
+
+  return out;
+}
 
 /**
  * Redenominate the candles from price to market cap.
@@ -154,15 +427,6 @@ function toMarketCap(d: Replay): Replay {
       c: c.c * s,
     })),
   };
-}
-
-/** Market cap for an axis label: $1.2M, $940K, $8.4K. */
-function capLabel(v: number): string {
-  if (!Number.isFinite(v) || v <= 0) return "$0";
-  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
-  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
-  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
-  return `$${v.toFixed(0)}`;
 }
 
 /**
@@ -244,16 +508,33 @@ export function WalletReplay({
   /** Null when not recording; otherwise 0..1. */
   const [clipping, setClipping] = useState<number | null>(null);
   const abortClip = useRef(false);
+  const [shape, setShape] = useStoredValue<Shape>(
+    "trickshot:shape",
+    "landscape",
+    SHAPES,
+  );
+  /** Set to the projected length when a clip would run past the ceiling. */
+  const [tooLong, setTooLong] = useState<number | null>(null);
+  /** Shows the frames as they are encoded, where the chart usually sits. */
+  const previewRef = useRef<HTMLCanvasElement>(null);
   /**
-   * The playhead, readable from outside React's render cycle.
-   *
-   * The recorder runs in an async loop that closes over its starting state;
-   * without this it would watch an `at` frozen at zero and never finish.
+   * What this browser can encode. Asked once, and asked ASYNCHRONOUSLY —
+   * WebCodecs answers with a promise, so unlike the check this replaced there
+   * is a moment where the answer is not known yet and the button has to say so
+   * rather than claim the browser cannot do it.
    */
-  const atRef = useRef(0);
-  const doneRef = useRef(false);
-  /** What is floating over the chart right now, for the recorder to redraw. */
-  const flashesRef = useRef<Flash[]>([]);
+  const [encoders, setEncoders] = useState<Encoders | null | "probing">(
+    "probing",
+  );
+  useEffect(() => {
+    let dead = false;
+    void negotiate().then((e) => {
+      if (!dead) setEncoders(e);
+    });
+    return () => {
+      dead = true;
+    };
+  }, []);
   /**
    * Fills currently animating over the chart.
    *
@@ -286,21 +567,7 @@ export function WalletReplay({
   );
 
   const holder = useRef<HTMLDivElement>(null);
-  const api = useRef<{
-    chart: {
-      remove(): void;
-      timeScale(): { scrollToRealTime(): void };
-      /** A composed copy of the chart exactly as drawn — axes and all. */
-      takeScreenshot(): HTMLCanvasElement;
-    };
-    series: { setData(rows: unknown[]): void; update(row: unknown): void };
-    markers: { setMarkers(m: unknown[]): void } | null;
-    lwc: typeof import("lightweight-charts");
-    /** Index already painted into THIS series, so a step can append instead of
-     *  rebuilding. Lives on the handle because it is only meaningful for the
-     *  chart currently mounted — a mode switch builds a fresh, empty one. */
-    painted: number;
-  } | null>(null);
+  const api = useRef<ChartApi | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -546,27 +813,10 @@ export function WalletReplay({
     const bar = data.candles[at];
     if (!bar) return;
 
-    const iv = data.interval;
-    const inBar = data.trades.filter(
-      (t) =>
-        t.kind !== "transfer" &&
-        t.usd > 0 &&
-        Math.floor(t.ts / iv) * iv === bar.t,
-    );
+    const inBar = fillsInBar(data, at, alongside.length > 0);
     if (inBar.length === 0) return;
 
-    // Summed per side: a router can put a dozen fills in one bar, and twelve
-    // labels climbing the screen together says less than two do.
-    const bySide = new Map<string, { isBuy: boolean; usd: number; who?: string }>();
-    for (const t of inBar) {
-      const who = alongside.length > 0 ? (t.wallet ?? undefined) : undefined;
-      const key = `${t.isBuy}:${who ?? ""}`;
-      const at = bySide.get(key) ?? { isBuy: t.isBuy, usd: 0, who };
-      at.usd += t.usd;
-      bySide.set(key, at);
-    }
-
-    const born: Flash[] = [...bySide.values()].map((v, i) => ({
+    const born: Flash[] = inBar.map((v, i) => ({
       id: (flashId += 1),
       isBuy: v.isBuy,
       usd: v.usd,
@@ -639,11 +889,6 @@ export function WalletReplay({
     return () => clearInterval(timer);
   }, [flashes.length]);
 
-  /** The recorder reads these; React state alone is invisible to it. */
-  useEffect(() => {
-    flashesRef.current = flashes;
-  }, [flashes]);
-
   /**
    * Sound follows the bar, not the fills list.
    *
@@ -651,21 +896,14 @@ export function WalletReplay({
    * per fill, or a router splitting a sale across a dozen pools would fire a
    * dozen tills at once.
    */
-  const FANFARE_AT = 20_000;
   useEffect(() => {
-    if (!soundOn || !data || !playing) return;
+    // Never while exporting: that clip's sound is rendered offline onto its own
+    // timeline, and a cue firing here would only be heard by the room.
+    if (!soundOn || !data || !playing || clipping !== null) return;
     const bar = data.candles[at];
     if (!bar) return;
 
-    const iv = data.interval;
-    const sold = data.trades.some(
-      (t) =>
-        t.kind !== "transfer" &&
-        !t.isBuy &&
-        t.usd > 0 &&
-        Math.floor(t.ts / iv) * iv === bar.t,
-    );
-    if (sold) playCue("kaching");
+    if (soldInBar(data, at)) playCue("kaching");
 
     /**
      * Once per $20K gained. A bar that leaps several steps at once still
@@ -679,209 +917,253 @@ export function WalletReplay({
       tier.current = reached;
       playCue("bandos");
     }
-  }, [at, data, playing, soundOn]);
-
-  useEffect(() => {
-    atRef.current = at;
-    if (data && at >= data.candles.length - 1) doneRef.current = true;
-  }, [at, data]);
+  }, [at, data, playing, soundOn, clipping]);
 
   /**
-   * Repaint the floating labels onto a recorded frame.
+   * Render the replay to a file.
    *
-   * They live in HTML above the canvas, so `takeScreenshot` cannot see them —
-   * the chart does not know they exist. This redraws what the page is showing
-   * AT THAT MOMENT, reading the same state the page renders from, rather than
-   * recomputing which fills belong to which bar. Getting that second guess
-   * wrong is what made the previous exporter disagree with the live view.
+   * The replay is DRIVEN here rather than watched: the exporter decides what
+   * moment each frame is, seeks the chart to it, and composes the frame around
+   * the result. That is what lets the clip come out at a flat 30fps on any
+   * machine — a slow composite makes the export take longer, not the video run
+   * badly, which is precisely what the old wall-clock recorder could not do.
    *
-   * Positions are in page pixels and the recording is in canvas pixels, so
-   * everything scales by the ratio between them.
-   */
-  const drawFlashes = useCallback(
-    (ctx: CanvasRenderingContext2D, width: number, height: number) => {
-      const live = flashesRef.current;
-      if (live.length === 0) return;
-      const css = holder.current?.clientWidth ?? width;
-      const k = width / Math.max(css, 1);
-      const now = Date.now();
-
-      /** Matches the CSS: 240ms in, hold, 240ms out. */
-      const alphaOf = (f: Flash) => {
-        if (f.phase === "enter") return 0;
-        if (f.phase === "shown") return Math.min(1, (now - f.bornAt) / 240);
-        return Math.max(0, 1 - (now - (f.outAt ?? now)) / 240);
-      };
-
-      for (const f of live) {
-        const alpha = alphaOf(f);
-        if (alpha <= 0) continue;
-        const tint = f.isBuy ? "53, 211, 153" : "255, 90, 90";
-        const glow = ctx.createRadialGradient(
-          width / 2,
-          height / 2,
-          0,
-          width / 2,
-          height / 2,
-          Math.max(width, height) * 0.6,
-        );
-        glow.addColorStop(0, `rgba(${tint}, ${0.2 * alpha})`);
-        glow.addColorStop(1, `rgba(${tint}, 0)`);
-        ctx.fillStyle = glow;
-        ctx.fillRect(0, 0, width, height);
-      }
-
-      ctx.textAlign = "center";
-      live.forEach((f) => {
-        const alpha = alphaOf(f);
-        if (alpha <= 0) return;
-        // The same drift the CSS applies as a label leaves.
-        const rise = f.phase === "out" ? (1 - alpha) * 30 : (1 - alpha) * -14;
-        const y = (34 + f.slot * 42 + 26 - rise) * k;
-
-        ctx.globalAlpha = alpha;
-        ctx.fillStyle = f.isBuy ? "#35d399" : "#ff5a5a";
-        ctx.font = `800 ${26 * k}px ui-monospace, "JetBrains Mono", "SF Mono", monospace`;
-        const head = `${usdCompact(f.usd)} ${f.isBuy ? "BUY" : "SELL"}`;
-        const tail = ` (${capLabel(f.cap)}${asCap ? " MC" : ""})`;
-        const headWidth = ctx.measureText(head).width;
-        ctx.font = `700 ${17 * k}px ui-monospace, "JetBrains Mono", "SF Mono", monospace`;
-        const tailWidth = ctx.measureText(tail).width;
-        const left = width / 2 - (headWidth + tailWidth) / 2;
-
-        ctx.textAlign = "left";
-        ctx.font = `800 ${26 * k}px ui-monospace, "JetBrains Mono", "SF Mono", monospace`;
-        ctx.fillText(head, left, y);
-        ctx.fillStyle = "#98a2b0";
-        ctx.font = `700 ${17 * k}px ui-monospace, "JetBrains Mono", "SF Mono", monospace`;
-        ctx.fillText(tail, left + headWidth, y);
-        ctx.globalAlpha = 1;
-      });
-      ctx.textAlign = "left";
-    },
-    [asCap],
-  );
-
-  /**
-   * Record the chart exactly as it is drawn.
-   *
-   * The replay is NOT driven by the recorder — it plays normally and each
-   * frame is copied off the chart with `takeScreenshot`, one to one, at the
-   * chart's own size. That is the whole design: an earlier version rebuilt the
-   * frame on a canvas of its own and got it wrong in ways the live view never
-   * was — markers left at whatever the viewer had scrubbed to, the colour wash
-   * missing entirely. Copying cannot drift from what it copies.
-   *
-   * The consequence is that only the chart is in the file. The flash labels
-   * float in HTML above the canvas and the chart knows nothing about them.
+   * For the duration the chart belongs to this function. Playback is stopped,
+   * the controls that could rebuild or reload it are disabled, and the holder
+   * is moved off-screen at the export's own size so the chart redraws crisply
+   * at that resolution instead of being upscaled from the page.
    */
   const exportClip = useCallback(async () => {
     const a = api.current;
-    if (!a || !data || data.candles.length < 2) return;
-    if (soundOn) await prepareSound();
+    const holderEl = holder.current;
+    if (!a || !holderEl || !data || data.candles.length < 2) return;
+    if (!encoders || encoders === "probing") return;
 
-    const first = a.chart.takeScreenshot();
-    const width = first.width;
-    const height = first.height;
-    if (!width || !height) return;
+    const bars = data.candles.length;
+    const stepMs = STEP_MS / speed;
+    const replaySeconds = (bars * stepMs) / 1_000;
+    if (replaySeconds + OUTRO_SECONDS > MAX_CLIP_SECONDS) {
+      setTooLong(Math.round(replaySeconds + OUTRO_SECONDS));
+      return;
+    }
+    setTooLong(null);
+
+    const layout = layoutFor(shape);
+    const dpr = window.devicePixelRatio || 1;
+    /** Output pixels per design pixel. Everything the chart draws scales by it. */
+    const k = layout.chart.w / DESIGN_W;
+    const cssW = layout.chart.w / dpr;
+    const cssH = layout.chart.h / dpr;
+    /** A lightweight-charts option, which are all in CSS pixels. */
+    const opt = (designPx: number) => (designPx * k) / dpr;
+
+    const perWallet = alongside.length > 0;
+    const filled: { bar: number; at: number; fills: Fill[] }[] = [];
+    const caps: number[] = [];
+    for (let bar = 0; bar < bars; bar += 1) {
+      caps.push(data.candles[bar]?.c ?? 0);
+      if (!effectsOn) continue;
+      const fills = fillsInBar(data, bar, perWallet);
+      if (fills.length > 0) filled.push({ bar, at: bar * stepMs, fills });
+    }
+
+    const replayFrames = Math.ceil((replaySeconds * FPS));
+    const outroFrames = OUTRO_SECONDS * FPS;
+    const frames = replayFrames + outroFrames;
+
+    const last = data.points[data.points.length - 1];
+    const bought = last?.boughtUsd ?? 0;
+    const totals: Totals | null = last
+      ? {
+          bought,
+          sold: last.soldUsd,
+          total: last.total,
+          // Nothing spent means no percentage exists to show — a wallet that
+          // was airdropped its tokens would otherwise divide by zero.
+          pct: bought > 0 ? (last.total / bought) * 100 : null,
+        }
+      : null;
 
     abortClip.current = false;
-    doneRef.current = false;
     setClipping(0);
-    // Start from the top, playing, and never loop — the recording has to end.
-    setAt(0);
-    atRef.current = 0;
-    setPlaying(true);
+    setPlaying(false);
 
-    // One frame for the chart to repaint at bar zero before the first capture.
-    await new Promise((r) => requestAnimationFrame(() => r(null)));
+    /**
+     * Past a macrotask, not just a frame.
+     *
+     * `clipping` is what stands the live paint loop down, and React may not
+     * have run that effect by the next animation frame — so yielding only an
+     * rAF here leaves the live loop writing over the exporter's first seek.
+     */
+    await new Promise((r) => setTimeout(r, 0));
+
+    const restore = (() => {
+      const style = holderEl.getAttribute("style") ?? "";
+      return () => {
+        holderEl.setAttribute("style", style);
+        const live = api.current;
+        if (!live) return;
+        // Against the live handle, not the captured one: if the chart was
+        // rebuilt it was built inside a holder still at export size, and with
+        // no autoSize it kept that width.
+        live.chart.resize(holderEl.clientWidth, 340);
+        live.chart.applyOptions({
+          layout: { fontSize: 12 },
+          timeScale: {
+            barSpacing: BAR_SPACING,
+            rightOffset: Math.round(
+              (holderEl.clientWidth || 900) / BAR_SPACING / 2,
+            ),
+          },
+          // The library's own defaults, which the export overrides.
+          rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.1 } },
+        });
+        live.chart.timeScale().scrollToRealTime();
+        live.painted = -1;
+      };
+    })();
 
     try {
-      const bars = data.candles.length;
-      const result = await record({
-        width,
-        height,
-        fps: 30,
-        cancelled: () => abortClip.current,
-        done: () => doneRef.current,
-        audio: soundOn ? captureTrack() : null,
-        onProgress: () => setClipping(atRef.current / Math.max(bars - 1, 1)),
-        frame: (ctx) => {
-          /**
-           * Paint the ground before the chart, every frame.
-           *
-           * The chart is drawn on a TRANSPARENT background — the page supplies
-           * the colour behind it — so a screenshot carries no ground of its
-           * own. Drawn straight onto the previous frame, every bar stayed on
-           * screen for the rest of the recording and the whole thing smeared.
-           */
-          ctx.fillStyle = "#0a0b0d";
-          ctx.fillRect(0, 0, width, height);
-          ctx.drawImage(a.chart.takeScreenshot(), 0, 0, width, height);
-          drawFlashes(ctx, width, height);
+      if (soundOn) await prepareSound();
+      const audio = soundOn
+        ? await renderCues(
+            cueSchedule(data, stepMs),
+            replaySeconds + OUTRO_SECONDS,
+          )
+        : null;
+
+      holderEl.style.position = "fixed";
+      holderEl.style.left = "-100000px";
+      holderEl.style.top = "0";
+      holderEl.style.width = `${cssW}px`;
+      holderEl.style.height = `${cssH}px`;
+
+      /**
+       * Resize first, then apply the options.
+       *
+       * `lockVisibleTimeRangeOnResize` rewrites barSpacing by the ratio of the
+       * new width to the old one on every resize; setting ours afterwards
+       * simply overwrites that, so the option needs no special handling.
+       *
+       * `rightOffset` is a bar COUNT, so it works out to the same number at
+       * any scale — but it is only ever set at construction, so it has to be
+       * named here and again on the way back.
+       */
+      a.chart.resize(cssW, cssH);
+      a.chart.applyOptions({
+        layout: { fontSize: opt(12) },
+        timeScale: {
+          barSpacing: opt(BAR_SPACING),
+          rightOffset: Math.round(cssW / opt(BAR_SPACING) / 2),
+        },
+        rightPriceScale: { scaleMargins: layout.scaleMargins },
+      });
+
+      a.painted = -1;
+      seek(a, data, marks, mode, 0, 0);
+      await new Promise((r) => requestAnimationFrame(() => r(null)));
+
+      let cursor = -1;
+      const result = await encode({
+        shape,
+        encoders,
+        frames,
+        fps: FPS,
+        audio,
+        cancelled: () => abortClip.current || api.current !== a,
+        onProgress: (i) => {
+          // On bar boundaries only — a setState per frame would cost more than
+          // the frame does.
+          if (i % FPS === 0) setClipping(i / frames);
+        },
+        draw: (ctx, i) => {
+          if (api.current !== a) throw new Error("chart went away mid-export");
+          const clipMs = Math.min(i / FPS, replaySeconds) * 1_000;
+          const exact = clipMs / stepMs;
+          const bar = Math.min(Math.floor(exact), bars - 1);
+          seek(a, data, marks, mode, bar, Math.min(exact - bar, 1));
+
+          while (cursor + 1 < filled.length && filled[cursor + 1].at <= clipMs) {
+            cursor += 1;
+          }
+
+          const point = data.points[Math.min(bar, data.points.length - 1)] ?? null;
+          paint(ctx, {
+            layout,
+            shot: a.chart.takeScreenshot(),
+            label,
+            wallet,
+            asCap,
+            point,
+            trades: data.trades.filter(
+              (t) => t.ts <= (data.candles[bar]?.t ?? 0) + data.interval,
+            ).length,
+            flashes:
+              cursor >= 0 ? flashesAtClip(filled, cursor, clipMs, caps) : [],
+            outro:
+              i < replayFrames ? 0 : (i - replayFrames + 1) / outroFrames,
+            totals,
+          });
+
+          const preview = previewRef.current;
+          if (preview) {
+            const pctx = preview.getContext("2d");
+            if (pctx) {
+              pctx.drawImage(ctx.canvas, 0, 0, preview.width, preview.height);
+            }
+          }
         },
       });
+
       if (result && !abortClip.current) {
         const who = (label ?? wallet).replace(/[^\w.-]+/g, "-").slice(0, 40);
-        save(result.blob, `trickshot-${who}.${result.ext}`);
+        const { w, h } = FORMATS[shape];
+        save(result.blob, `trickshot-${who}-${w}x${h}.${result.ext}`);
       }
+    } catch {
+      // A chart pulled out from under the loop, or an encoder that gave up.
+      // Nothing is saved and the replay goes back to how it was.
     } finally {
+      restore();
       setClipping(null);
-      setPlaying(false);
     }
-  }, [data, drawFlashes, label, soundOn, wallet]);
+  }, [
+    alongside.length,
+    asCap,
+    data,
+    effectsOn,
+    encoders,
+    label,
+    marks,
+    mode,
+    shape,
+    soundOn,
+    speed,
+    wallet,
+  ]);
 
   /**
    * Paint and play, in one loop.
    *
-   * The bar being replayed is drawn FORMING rather than appearing: its close
-   * walks from the open toward the real close across the step, with the high
-   * and low revealed as it goes, exactly as a live candle behaves while trades
-   * land in it. Appending finished bars on a timer made the chart tick like a
-   * slideshow, which is the thing that read as unnatural.
-   *
    * Driven by requestAnimationFrame off the wall clock, so the motion is smooth
    * at any speed and honest about dropped frames. React state only changes on a
-   * bar boundary — a re-render per frame would cost more than it drew.
-   *
-   * Everything behind the current bar is finished history, so it is painted
-   * once per structural change (a scrub, the loop wrapping, a mode switch)
-   * rather than every frame.
+   * bar boundary — a re-render per frame would cost more than it drew, and
+   * `seek` keeps the structural work behind its own per-bar guard.
    */
   useEffect(() => {
     const a = api.current;
     if (!a || !data || data.candles.length === 0) return;
+    /**
+     * The exporter owns the chart while a clip is being made — it seeks the
+     * series itself, and two writers on one series fight. `clipping` is in the
+     * deps, so an export starting re-runs this effect: the cleanup cancels the
+     * frame already queued and the return stops another being asked for.
+     */
+    if (clipping !== null) return;
     const total = data.candles.length;
 
-    const finished = (c: (typeof data.candles)[number]) =>
-      mode === "candles"
-        ? { time: c.t, open: c.o, high: c.h, low: c.l, close: c.c }
-        : { time: c.t, value: c.c };
-
-    // Repaint the completed history only when it is not simply one step on.
-    if (a.painted !== at - 1) {
-      a.series.setData(data.candles.slice(0, at).map(finished));
-      a.chart.timeScale().scrollToRealTime();
-    }
-    a.painted = at;
-
-    const cutoff = data.candles[at]?.t ?? 0;
-    const visible = marks.filter((m) => m.time <= cutoff);
-    if (a.markers) a.markers.setMarkers(visible);
-    else if (visible.length > 0) {
-      a.markers = a.lwc.createSeriesMarkers(
-        a.series as never,
-        visible as never,
-      ) as unknown as { setMarkers(m: unknown[]): void };
-    }
-
-    const bar = data.candles[at];
-    if (!bar) return;
-    const prev = data.candles[at - 1];
-    const from = prev?.c ?? bar.o;
-
     if (!playing) {
-      a.series.update(finished(bar));
+      seek(a, data, marks, mode, at, 1);
       return;
     }
 
@@ -891,22 +1173,7 @@ export function WalletReplay({
 
     const frame = (now: number) => {
       const p = Math.min((now - started) / duration, 1);
-      // Ease slightly: a linear walk looks mechanical at low speeds.
-      const eased = p * p * (3 - 2 * p);
-      const close = mode === "candles" ? bar.o + (bar.c - bar.o) * eased : from + (bar.c - from) * eased;
-      a.series.update(
-        mode === "candles"
-          ? {
-              time: bar.t,
-              open: bar.o,
-              // The extremes arrive with the move rather than being there from
-              // the first frame, which is what a bar filling in looks like.
-              high: Math.max(bar.o, close, bar.o + (bar.h - bar.o) * eased),
-              low: Math.min(bar.o, close, bar.o + (bar.l - bar.o) * eased),
-              close,
-            }
-          : { time: bar.t, value: close },
-      );
+      seek(a, data, marks, mode, at, p);
       if (p >= 1) {
         const next = at + 1;
         if (next >= total) {
@@ -919,7 +1186,7 @@ export function WalletReplay({
            * opening frame before it stopped, which throws away the ending —
            * the part a recording is usually made for.
            */
-          if (!autoPlay || clipping !== null) {
+          if (!autoPlay) {
             setPlaying(false);
             return;
           }
@@ -935,17 +1202,32 @@ export function WalletReplay({
     return () => cancelAnimationFrame(raf);
   }, [at, data, marks, mode, playing, speed, autoPlay, chartBuilt, clipping]);
 
-  /** Decided once: what this browser can actually record. */
-  const container = useMemo(() => bestContainer(), []);
 
   const now: ReplayPoint | undefined = data?.points[Math.min(at, (data?.points.length ?? 1) - 1)];
   const up = (now?.total ?? 0) >= 0;
   const total = data?.candles.length ?? 0;
 
+  /**
+   * Everything that could move the replay is frozen while a clip renders.
+   *
+   * Not politeness — the export holds the chart for up to a minute and a half,
+   * and several of these controls destroy it. Changing zoom or mode rebuilds
+   * the chart outright; ticking a linked wallet re-runs the load, which resets
+   * the playhead, starts playback and can flip the axis into rebuilding the
+   * chart as well. Any of them mid-clip leaves the exporter screenshotting
+   * something that no longer exists.
+   */
+  const locked = clipping !== null;
+  const clipSeconds = Math.round(
+    (total * (STEP_MS / speed)) / 1_000 + OUTRO_SECONDS,
+  );
+
   return (
     <div
       className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/75 p-2 sm:items-center sm:p-4"
-      onClick={onClose}
+      /* Ignored while a clip renders: closing would unmount the chart the
+         exporter is still reading frames from. */
+      onClick={locked ? undefined : onClose}
     >
       <div
         className="my-auto w-full max-w-[1040px] rounded-md border border-line-strong bg-ink-900 p-4 sm:p-6"
@@ -995,8 +1277,21 @@ export function WalletReplay({
           </div>
         </div>
 
-        <div className="relative w-full">
+        <div className="relative w-full" style={{ minHeight: 340 }}>
           <div ref={holder} className="w-full" style={{ height: 340 }} />
+
+          {/* The chart is off-screen at export size while this renders, so its
+              usual place shows the frames actually being encoded. */}
+          {locked && (
+            <div className="absolute inset-0 flex items-center justify-center bg-ink-900">
+              <canvas
+                ref={previewRef}
+                width={FORMATS[shape].w / 4}
+                height={FORMATS[shape].h / 4}
+                className="max-h-[320px] max-w-full rounded-xs border border-line object-contain"
+              />
+            </div>
+          )}
 
           {!data && (
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-ink-900">
@@ -1102,6 +1397,14 @@ export function WalletReplay({
           </div>
         )}
 
+        {tooLong !== null && clipping === null && (
+          <p className="mt-4 font-mono text-[11px] text-amber">
+            That clip would run {tooLong}s, past the {MAX_CLIP_SECONDS}s ceiling
+            — the whole file is held in memory while it is written. Raise the
+            speed or the bar width and it will fit.
+          </p>
+        )}
+
         {clipping !== null && (
           <div className="mt-4 flex items-center gap-3">
             <div className="h-1 flex-1 overflow-hidden rounded-full bg-ink-700">
@@ -1125,7 +1428,7 @@ export function WalletReplay({
           </div>
         )}
 
-        {container?.ext === "webm" && clipping === null && (
+        {encoders && encoders !== "probing" && encoders.ext === "webm" && clipping === null && (
           <p className="mt-3 font-mono text-[10.5px] text-tx3">
             This browser records WebM, which X does not accept. Chrome and
             Safari save MP4 directly.
@@ -1135,6 +1438,7 @@ export function WalletReplay({
         <div className="mt-5 flex flex-wrap items-center gap-3">
           <button
             type="button"
+            disabled={locked}
             onClick={() => {
               if (soundOn) void prepareSound();
               setPlaying((p) => !p);
@@ -1156,7 +1460,7 @@ export function WalletReplay({
                   })
                   .finally(() => setFindingRelated(false));
               }}
-              disabled={findingRelated}
+              disabled={findingRelated || locked}
               className="cursor-pointer rounded-xs border border-line-strong px-2.5 py-1.5 font-mono text-[10px] tracking-[0.1em] text-tx2 uppercase hover:text-tx disabled:opacity-40"
             >
               {findingRelated
@@ -1170,6 +1474,7 @@ export function WalletReplay({
             <button
               key={s}
               type="button"
+              disabled={locked}
               onClick={() => setSpeed(s)}
               className={cx(
                 "cursor-pointer rounded-xs border px-2 py-1.5 font-mono text-[10px] uppercase",
@@ -1201,7 +1506,7 @@ export function WalletReplay({
                   setZoom(z);
                   setAt(i < 0 ? Math.max((next?.candles.length ?? 1) - 1, 0) : i);
                 }}
-                disabled={!raw}
+                disabled={!raw || locked}
                 title={`${barLabel((raw?.interval ?? 15) * z)} bars`}
                 className={cx(
                   "cursor-pointer rounded-xs border px-2 py-1.5 font-mono text-[10px] tracking-[0.1em] uppercase disabled:opacity-40",
@@ -1216,6 +1521,7 @@ export function WalletReplay({
           </div>
           <button
             type="button"
+            disabled={locked}
             onClick={() => {
               const next = !soundOn;
               setSoundOn(next);
@@ -1234,6 +1540,7 @@ export function WalletReplay({
           </button>
           <button
             type="button"
+            disabled={locked}
             onClick={() => setAutoPlay(!autoPlay)}
             title="Start over at the end instead of holding on the last bar"
             className={cx(
@@ -1247,6 +1554,7 @@ export function WalletReplay({
           </button>
           <button
             type="button"
+            disabled={locked}
             onClick={() => {
               setEffectsOn(!effectsOn);
               if (effectsOn) setFlashes([]);
@@ -1261,24 +1569,54 @@ export function WalletReplay({
           >
             fx
           </button>
+          <div className="flex gap-1">
+            {SHAPES.map((sh) => (
+              <button
+                key={sh}
+                type="button"
+                onClick={() => {
+                  setShape(sh);
+                  setTooLong(null);
+                }}
+                disabled={locked}
+                title={`${FORMATS[sh].w}x${FORMATS[sh].h}`}
+                className={cx(
+                  "cursor-pointer rounded-xs border px-2 py-1.5 font-mono text-[10px] tracking-[0.1em] uppercase disabled:cursor-default disabled:opacity-40",
+                  shape === sh
+                    ? "border-amber/40 bg-amber/10 text-amber"
+                    : "border-line-strong text-tx3 hover:text-tx2",
+                )}
+              >
+                {FORMATS[sh].label}
+              </button>
+            ))}
+          </div>
           <button
             type="button"
             onClick={() => void exportClip()}
-            disabled={!data || total < 2 || clipping !== null || !container}
+            disabled={!data || total < 2 || locked || !encoders || encoders === "probing"}
             title={
-              container
-                ? `Play it through and save the chart as ${container.ext.toUpperCase()}`
-                : "This browser cannot record video"
+              encoders === "probing"
+                ? "Checking what this browser can encode"
+                : encoders
+                  ? `Render ${FORMATS[shape].w}x${FORMATS[shape].h} and save it as ${encoders.ext.toUpperCase()}`
+                  : "This browser cannot encode video"
             }
             className="cursor-pointer rounded-xs border border-mint/40 bg-mint/10 px-2.5 py-1.5 font-mono text-[10px] tracking-[0.1em] text-mint uppercase disabled:opacity-40"
           >
-            {clipping !== null ? "recording…" : "export clip"}
+            {clipping !== null ? "rendering…" : "export clip"}
           </button>
+          {clipping === null && (
+            <span className="tnum font-mono text-[10px] text-tx3">
+              ~{clipSeconds}s
+            </span>
+          )}
           <div className="flex gap-1">
             {(["candles", "line"] as Mode[]).map((m) => (
               <button
                 key={m}
                 type="button"
+                disabled={locked}
                 onClick={() => setMode(m)}
                 className={cx(
                   "cursor-pointer rounded-xs border px-2 py-1.5 font-mono text-[10px] tracking-[0.1em] uppercase",
@@ -1293,6 +1631,7 @@ export function WalletReplay({
           </div>
           <input
             type="range"
+            disabled={locked}
             min={0}
             max={Math.max(total - 1, 0)}
             value={at}
@@ -1371,6 +1710,7 @@ export function WalletReplay({
                     >
                       <input
                         type="checkbox"
+                        disabled={locked}
                         checked={on}
                         onChange={() =>
                           setFolded((held) => {

@@ -16,6 +16,7 @@
     "@vercel/analytics": "^2.0.1",
     "bs58": "^6.0.0",
     "lightweight-charts": "^5.2.0",
+    "mediabunny": "^1.55.2",
     "next": "16.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",

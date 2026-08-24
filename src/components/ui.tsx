@@ -198,6 +198,44 @@ export function useStoredFlag(
   ];
 }
 
+/**
+ * The same store, for a value out of a fixed set.
+ *
+ * `useStoredFlag` coerces what it reads (`held === "1"`); anything returning a
+ * raw string does not, and a stale or hand-edited key would then be handed
+ * straight to code that indexes on it. So the permitted values come in with the
+ * call and anything else falls back — which covers a first visit's null too.
+ */
+export function useStoredValue<T extends string>(
+  key: string,
+  fallback: T,
+  allowed: readonly T[],
+): [T, (next: T) => void] {
+  const read = () => {
+    try {
+      const held = localStorage.getItem(key) as T | null;
+      return held !== null && allowed.includes(held) ? held : fallback;
+    } catch {
+      // Private windows and blocked site data throw on access.
+      return fallback;
+    }
+  };
+
+  const value = useSyncExternalStore(subscribeTo(key), read, () => fallback);
+
+  return [
+    value,
+    (next: T) => {
+      try {
+        localStorage.setItem(key, next);
+      } catch {
+        // A preference that cannot be stored still applies to this session.
+      }
+      for (const listener of listeners.get(key) ?? []) listener();
+    },
+  ];
+}
+
 /** Whether a replay starts playing the moment it opens. */
 export function useAutoPlay() {
   return useStoredFlag("trickshot:autoplay");
