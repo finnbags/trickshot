@@ -416,19 +416,61 @@ export function HistoryReplay({
   );
 }
 
+/** Helius mirrors token art here; the original is embedded in the path. */
+const CDN = "https://cdn.helius-rpc.com/cdn-cgi/image//";
+
+/**
+ * A gateway that will actually serve the file.
+ *
+ * Most Solana token art lives on IPFS and most of it is addressed through
+ * `ipfs.io`, which rate-limits hard. MEASURED across the tokens on this site:
+ * every image that failed to load was an `ipfs.io` URL answering 403, and
+ * every one that loaded was hosted somewhere else. `dweb.link` is the same
+ * operator and fails with it; Cloudflare's gateway is gone. Pinata and
+ * Filebase both serve the same CIDs.
+ */
+const IPFS_FALLBACK = "https://gateway.pinata.cloud/ipfs/";
+
+/** Rewrite an IPFS URL onto a gateway that answers. */
+function viaGateway(url: string): string | null {
+  const cid = url.match(/\/ipfs\/([A-Za-z0-9]+)/)?.[1];
+  return cid ? IPFS_FALLBACK + cid : null;
+}
+
 /**
  * The token's own artwork, which is how anyone actually recognises one.
  *
+ * Two sources are tried, because one is not reliable enough. Helius mirrors
+ * the file, which is what makes hotlink-protected hosts work at all; but the
+ * mirror has to fetch from wherever the creator put it — often an IPFS gateway
+ * — and that can fail or time out. The original is embedded in the mirror's
+ * own path, so the fallback needs nothing stored alongside it.
+ *
+ * `referrerPolicy="no-referrer"` matters more than it looks: at least one host
+ * here serves the image to a bare request and answers 403 when a browser sends
+ * a Referer, so sending none is what makes the direct URL usable at all.
+ *
  * A plain `img` rather than `next/image`: these come from whatever host the
- * creator used — arbitrary IPFS gateways, launchpad CDNs — and `next/image`
- * would need every one of them declared up front. A broken or missing image
- * falls back to the ticker's initials rather than a gap.
+ * creator used, and `next/image` would need every one declared up front.
  */
 function TokenMark({ image, symbol }: { image?: string; symbol?: string }) {
-  const [broken, setBroken] = useState(false);
+  const [attempt, setAttempt] = useState(0);
   const initials = (symbol ?? "?").replace(/[^A-Za-z0-9]/g, "").slice(0, 3);
 
-  if (!image || broken) {
+  /**
+   * The mirror, then a working IPFS gateway, then the original.
+   *
+   * In that order deliberately: the mirror handles hosts that refuse to serve
+   * anyone else, the gateway handles the mirror failing to reach a rate-limited
+   * `ipfs.io`, and the original covers whatever neither anticipated.
+   */
+  const origin = image?.startsWith(CDN) ? image.slice(CDN.length) : image;
+  const sources = [image, origin ? viaGateway(origin) : null, origin]
+    .filter((u): u is string => Boolean(u))
+    .filter((u, i, all) => all.indexOf(u) === i);
+  const src = sources[attempt];
+
+  if (!src) {
     return (
       <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-sm border border-line bg-ink-900 font-mono text-[11px] font-bold tracking-[0.04em] text-tx3 uppercase">
         {initials || "?"}
@@ -439,11 +481,14 @@ function TokenMark({ image, symbol }: { image?: string; symbol?: string }) {
     /* eslint-disable-next-line @next/next/no-img-element --
        remote hosts are unknowable at build time; see TokenMark. */
     <img
-      src={image}
+      key={src}
+      src={src}
       alt=""
       loading="lazy"
-      onError={() => setBroken(true)}
-      className="h-11 w-11 shrink-0 rounded-sm border border-line object-cover"
+      decoding="async"
+      referrerPolicy="no-referrer"
+      onError={() => setAttempt((n) => n + 1)}
+      className="h-11 w-11 shrink-0 rounded-sm border border-line bg-ink-900 object-cover"
     />
   );
 }
