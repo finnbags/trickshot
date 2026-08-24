@@ -21,7 +21,14 @@ import { densityMap } from "./density";
 import { estimateSeconds, estimateWindow } from "./estimate";
 import { walletGraph, type Related, type WalletGraph } from "./graph";
 import { identify, tokenIdentity } from "./identity";
-import { charge, checkBudget, currentCaller, metered, spentSoFar } from "./meter";
+import {
+  BudgetExceeded,
+  charge,
+  checkBudget,
+  currentCaller,
+  metered,
+  spentSoFar,
+} from "./meter";
 import { recordSpend } from "./budget";
 import {
   accountKeys,
@@ -1583,9 +1590,39 @@ async function walletHistory(
    * that traded across three weeks gets the sampled chart, which is the honest
    * answer for a span that size.
    */
-  const drawn = await stage("candles", () =>
-    series(venue, mint, from, to, interval, sol),
-  );
+  let drawn;
+  try {
+    drawn = await stage("candles", () => series(venue, mint, from, to, interval, sol));
+  } catch (error) {
+    /**
+     * A ceiling hit here still knows which window it was drawing.
+     *
+     * `BudgetExceeded` is thrown from the meter, five layers down, and carries
+     * only a number — so the route caught it with no idea what to queue and
+     * enqueued the mint alone. The worker then had a job with no windows,
+     * built nothing, and marked it failed: three people waiting on a token
+     * that could never succeed.
+     *
+     * Re-thrown as the refusal that carries the window, so the queue can
+     * actually build the thing that was refused.
+     */
+    if (error instanceof BudgetExceeded) {
+      const cached = await loadSeries(mint, interval);
+      const bars = missingRanges(cached, from, to, interval).reduce(
+        (n, gap) => n + Math.ceil((gap.to - gap.from) / interval),
+        0,
+      );
+      throw new TooLarge(error.message, {
+        bars,
+        credits: error.spent,
+        seconds: Math.round(bars * 0.048),
+        interval,
+        from,
+        to,
+      });
+    }
+    throw error;
+  }
 
   if (drawn.candles.length === 0) return null;
 

@@ -87,8 +87,19 @@ export async function GET(request: Request) {
        * refused for exactly the reason it was refused before, and the queue
        * would go round again at full price.
        */
+      const windows = job.windows ?? [];
+      if (windows.length === 0) {
+        // Nothing to draw. Older rows predate the guard in `enqueue`; marking
+        // them done rather than failed keeps the queue honest about which
+        // tokens actually could not be read.
+        await finish(job.mint, { ok: true });
+        built.push({ mint: job.mint, ok: true });
+        await releaseBuildSlot();
+        continue;
+      }
+
       let bars = 0;
-      for (const w of job.windows ?? []) {
+      for (const w of windows) {
         bars += await buildWindow(job.mint, w.interval, w.from, w.to);
       }
 

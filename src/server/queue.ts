@@ -226,6 +226,22 @@ export async function enqueue(
   hint: { credits?: number; seconds?: number; window?: Window } = {},
 ): Promise<Enqueued> {
   /**
+   * A job with no window is a job that cannot succeed.
+   *
+   * The worker builds the windows it is given and nothing else, so an empty
+   * list means it draws no bars, reports none built, and the job is marked
+   * failed after its retries — MEASURED in production: three people waiting on
+   * a token queued without one. Refusing the enqueue is the honest answer;
+   * silently accepting work that will fail is not.
+   */
+  if (!hint.window) {
+    return {
+      job: { mint, status: "failed", windows: [], requests: 1, at: nowSec(), attempts: 0 },
+      ahead: 0,
+      accepted: false,
+    };
+  }
+  /**
    * One statement in Postgres, or read-modify-write on a blob.
    *
    * The blob shape lost jobs: two visitors enqueueing at the same moment each
