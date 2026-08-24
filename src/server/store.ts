@@ -156,6 +156,35 @@ export const saveSeries = (series: Series) =>
   saveBlob(`series:${series.mint}:${series.interval}`, series);
 
 /**
+ * Where a token has bars finer than its own chart, so a replay can zoom in.
+ *
+ * Its own blob, and a tiny one, because it is read on the REQUEST path — every
+ * wallet replay asks whether this mint can be zoomed. Deriving it from the
+ * fine series instead means pulling that whole series to look at its first and
+ * last bar: MEASURED, 1.18MB for five days of one-minute bars.
+ */
+export interface ZoomIndex {
+  mint: string;
+  /** Bar width of the fine series, seconds. */
+  interval: number;
+  /**
+   * The CONTIGUOUS spans it covers, unix seconds, ascending.
+   *
+   * Ranges rather than one from/to, because a token can be built over two
+   * stretches that do not touch — its launch and its best day a fortnight
+   * later. Collapsed to first-bar-to-last-bar, the empty fortnight between
+   * them would be advertised as zoomable, and asking for a section inside it
+   * would put a live build on the request path, which is the one thing this
+   * index exists to prevent.
+   */
+  ranges: { from: number; to: number }[];
+}
+
+export const loadZoom = (mint: string) => loadBlob<ZoomIndex>(`zoom:${mint}`);
+
+export const saveZoom = (zoom: ZoomIndex) => saveBlob(`zoom:${zoom.mint}`, zoom);
+
+/**
  * Which parts of a window the cache cannot answer.
  *
  * Returned as whole intervals so the caller fetches bar-aligned ranges. The

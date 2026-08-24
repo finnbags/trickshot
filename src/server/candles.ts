@@ -294,7 +294,24 @@ function traderOf(
 }
 
 /** Bucket swaps into bars, carrying each open from the last close. */
-function toCandles(swaps: Swap[], from: number, to: number, interval: number): Candle[] {
+function toCandles(
+  swaps: Swap[],
+  from: number,
+  to: number,
+  interval: number,
+  /**
+   * The close of the bar before this window, when there is one.
+   *
+   * Without it a window holding NO swaps emits nothing at all, because a flat
+   * bar needs a price to be flat at. That is right at the very start of a
+   * token and wrong everywhere else — and it is what made a hole in a cached
+   * series permanent: the gap is refetched, the minute really did have no
+   * trades, no bar is produced, so the gap is still a gap the next time.
+   * Seeded with the last known close, a quiet minute becomes the flat bar it
+   * was.
+   */
+  seed = 0,
+): Candle[] {
   const buckets = new Map<number, Swap[]>();
   for (const s of swaps) {
     const t = Math.floor(s.ts / interval) * interval;
@@ -304,7 +321,7 @@ function toCandles(swaps: Swap[], from: number, to: number, interval: number): C
   }
 
   const out: Candle[] = [];
-  let last = 0;
+  let last = seed;
   const start = Math.floor(from / interval) * interval;
   for (let t = start; t < to; t += interval) {
     const held = buckets.get(t);
@@ -538,6 +555,8 @@ export async function buildCandles(
   interval: number,
   sol: SolPriceHistory,
   density: Density,
+  /** Close of the bar before this window. See `toCandles`. */
+  seed = 0,
 ): Promise<CandleWindow> {
   const estimated = expectedSwaps(density, from, to);
 
@@ -573,7 +592,7 @@ export async function buildCandles(
       if (DEBUG) console.log(`[candles] exact read ${read.swaps.length} swaps in ${Date.now() - t1}ms`);
       if (read.complete && read.swaps.length > 0) {
         return {
-          candles: toCandles(read.swaps, from, to, interval),
+          candles: toCandles(read.swaps, from, to, interval, seed),
           exact: true,
           swaps: read.swaps,
           read: read.swaps.length,
@@ -647,12 +666,35 @@ export async function buildCandles(
 
   await sweep(buckets);
 
-  /** A bar the density says should be busy, that came back with nothing. */
-  const suspicious = (t: number) =>
-    failed.has(t) ||
-    ((found.get(t) ?? 0) === 0 && expectedSwaps(density, t, t + interval) >= 4);
+  /** A read that came back with nothing where the density expected trades. */
+  const barren = (t: number) =>
+    (found.get(t) ?? 0) === 0 && expectedSwaps(density, t, t + interval) >= 4;
 
-  const retry = buckets.filter(suspicious);
+  /**
+   * Barren buckets, grouped into the consecutive runs they form.
+   *
+   * Grouped for the sake of the check below, which costs the same for a run of
+   * one bucket as for a run of two hundred — not because a longer run is more
+   * suspicious. EVERY barren bucket is checked: a single one is exactly the
+   * case that used to slip through, and it is also the commonest, since a
+   * cached series is refetched one bar at a time.
+   */
+  const barrenRuns = (): number[][] => {
+    const runs: number[][] = [];
+    for (let i = 0; i < buckets.length; ) {
+      if (!barren(buckets[i] as number)) {
+        i += 1;
+        continue;
+      }
+      let j = i;
+      while (j < buckets.length && barren(buckets[j] as number)) j += 1;
+      runs.push(buckets.slice(i, j));
+      i = j;
+    }
+    return runs;
+  };
+
+  const retry = [...new Set([...failed, ...barrenRuns().flat()])].sort((a, b) => a - b);
   if (retry.length > 0) {
     failed.clear();
     if (DEBUG) console.log(`[candles] retrying ${retry.length} empty buckets`);
@@ -660,17 +702,47 @@ export async function buildCandles(
   }
 
   /**
-   * Still empty after a retry: reported, not stored. The caller keeps these
-   * out of the cache so the next request tries again rather than serving a
-   * hole for ever.
+   * Ask the chain about the runs that are still empty, rather than guess.
+   *
+   * This used to be decided by the density map alone: empty where it expected
+   * trades meant unresolved, and unresolved bars are deliberately kept out of
+   * the cache so the next request tries again. That is right when the read
+   * failed and wrong when the market was simply quiet — and at one-minute bars
+   * quiet is common. MEASURED across eight indexed tokens, guessing split five
+   * contiguous days into as many as fifty-one ranges, each break a stretch
+   * that genuinely had no trades and could therefore never be filled in,
+   * however many times it was refetched.
+   *
+   * The check has to cover a run of ONE, which is the case a threshold would
+   * miss and the commonest of all: a warm series refetches only its newest
+   * bar, so a read that quietly comes back empty there is a single barren
+   * bucket. Left unchecked it is now WRITTEN — as a flat bar, seeded from the
+   * previous close — over whatever the cache held, and a bar invented that way
+   * is worse than the hole this mechanism used to leave.
+   *
+   * SIGNATURES settle it for ten credits a run, whatever the run's length:
+   * nothing there means nothing happened, and those bars are flat and true and
+   * safe to keep. Anything there means the reads really did lose data, which
+   * is the case this whole mechanism exists for.
    */
-  const suspect = buckets.filter(suspicious);
+  const unresolved = new Set<number>();
+  await Promise.all(
+    barrenRuns().map(async (run) => {
+      const first = run[0] as number;
+      const last = run[run.length - 1] as number;
+      const counted = await countSwaps(venue.pool, mint, first, last + interval, 1);
+      if (counted.complete && counted.count === 0) return;
+      for (const t of run) unresolved.add(t);
+    }),
+  );
+
+  const suspect = buckets.filter((t) => failed.has(t) || unresolved.has(t));
   if (DEBUG && suspect.length > 0) {
     console.log(`[candles] ${suspect.length} buckets unresolved`);
   }
 
   swaps.sort((a, b) => a.ts - b.ts);
-  const candles = toCandles(swaps, from, to, interval);
+  const candles = toCandles(swaps, from, to, interval, seed);
 
   /**
    * Volume is scaled, and says so.

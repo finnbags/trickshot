@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  barAt,
   fetchHistory,
+  ZOOM_MAX_BARS,
   fetchRelated,
   type RelatedReport,
   type Replay,
@@ -83,7 +85,16 @@ const ZOOMS = [1, 2, 4, 8] as const;
  * value for a merged bar is simply the last one inside it.
  */
 function coarsen(d: Replay | null, factor: number): Replay | null {
-  if (!d || factor <= 1 || d.candles.length === 0) return d;
+  /**
+   * Refused outright on a series with a zoomed section in it.
+   *
+   * Merging by `floor(t / (interval * factor))` groups bars by wall-clock
+   * time, so every minute bar of the fine stretch would collapse back into the
+   * two-hour bucket it sits inside — silently undoing the section the moment
+   * anyone touched the bar-width control. The control is disabled while a
+   * section is shown; this is the guard behind it.
+   */
+  if (!d || factor <= 1 || d.candles.length === 0 || d.zoom) return d;
   const interval = d.interval * factor;
 
   const candles: Replay["candles"] = [];
@@ -109,6 +120,16 @@ function coarsen(d: Replay | null, factor: number): Replay | null {
 
   return { ...d, interval, candles, points };
 }
+/** Where the scrubber is, in seconds — what the "here" buttons snap an edge to. */
+function barTime(d: Replay | null, bar: number): number {
+  return d?.candles[Math.min(Math.max(bar, 0), d.candles.length - 1)]?.t ?? 0;
+}
+
+/** A moment, short and in UTC — the chart's own timebase. */
+function stamp(sec: number): string {
+  return new Date(sec * 1_000).toISOString().slice(5, 16).replace("T", " ") + "Z";
+}
+
 /** Bar width for a label: 15s, 5m, 2h. */
 function barLabel(sec: number): string {
   if (sec >= 3_600) return `${(sec / 3_600).toFixed(sec % 3_600 ? 1 : 0)}h`;
@@ -199,11 +220,10 @@ export interface Fill {
 function fillsInBar(data: Replay, bar: number, perWallet: boolean): Fill[] {
   const candle = data.candles[bar];
   if (!candle) return [];
-  const iv = data.interval;
   const grouped = new Map<string, Fill>();
   for (const t of data.trades) {
     if (t.kind === "transfer" || !(t.usd > 0)) continue;
-    if (Math.floor(t.ts / iv) * iv !== candle.t) continue;
+    if (barAt(data.candles, t.ts) !== bar) continue;
     const who = perWallet ? (t.wallet ?? undefined) : undefined;
     const key = `${t.isBuy}:${who ?? ""}`;
     const held = grouped.get(key) ?? { isBuy: t.isBuy, usd: 0, who };
@@ -217,13 +237,12 @@ function fillsInBar(data: Replay, bar: number, perWallet: boolean): Fill[] {
 function soldInBar(data: Replay, bar: number): boolean {
   const candle = data.candles[bar];
   if (!candle) return false;
-  const iv = data.interval;
   return data.trades.some(
     (t) =>
       t.kind !== "transfer" &&
       !t.isBuy &&
       t.usd > 0 &&
-      Math.floor(t.ts / iv) * iv === candle.t,
+      barAt(data.candles, t.ts) === bar,
   );
 }
 
@@ -465,6 +484,18 @@ export function WalletReplay({
   const [raw, setRaw] = useState<Replay | null>(null);
   const [zoom, setZoom] = useState<number>(1);
   /**
+   * The stretch drawn at the finer bar width, and the one the control is
+   * currently pointing at.
+   *
+   * The control appears only when the server offers `zoomable`, which means a
+   * finer series is stored for this mint. `applied` is what the last fetch
+   * asked for; `picked` is what the sliders
+   * say and costs nothing until Apply is pressed, because moving them would
+   * otherwise refetch on every pixel of drag.
+   */
+  const [applied, setApplied] = useState<{ from: number; to: number } | null>(null);
+  const [picked, setPicked] = useState<{ from: number; to: number } | null>(null);
+  /**
    * What the chart actually draws. `raw` is what the server sent; every bar
    * width offered is derived from it without another request.
    */
@@ -561,6 +592,26 @@ export function WalletReplay({
    *  the chart is rebuilt once when it flips on load. */
   const asCap = (data?.supply ?? 0) > 0;
 
+  /**
+   * Where the section sliders currently sit, defaulting to the whole offered
+   * stretch until someone moves them, and clamped to it afterwards — the
+   * offered stretch changes when the wallet does, and a leftover pick from the
+   * previous wallet would sit outside it.
+   */
+  const zoomable = raw?.zoomable;
+  const span = useMemo(() => {
+    if (!zoomable) return null;
+    const from = Math.min(Math.max(picked?.from ?? zoomable.from, zoomable.from), zoomable.to);
+    const to = Math.max(Math.min(picked?.to ?? zoomable.to, zoomable.to), from);
+    // The selectable bounds travel with the selection, so the control reads
+    // them off one object that is known to exist rather than re-narrowing
+    // `raw?.zoomable` at every use inside the markup.
+    return { from, to, min: zoomable.from, max: zoomable.to, fine: zoomable.interval };
+  }, [zoomable, picked]);
+  const tooManyBars = Boolean(
+    span && (span.to - span.from) / span.fine > ZOOM_MAX_BARS,
+  );
+
   /** Sorted so the same selection in a different order is the same request. */
   const foldedKey = [...folded].sort().join(",");
   const alongside = useMemo(
@@ -594,17 +645,23 @@ export function WalletReplay({
       candles: h?.candles ?? [],
       trades: h?.trades ?? [],
       points: h?.points ?? [],
+      zoom: h?.zoom,
+      zoomable: h?.zoomable,
     });
     /**
      * A cluster reload is a real request, so it waits a moment: ticking three
      * wallets in a row should fetch once, not three times.
      */
     const load: Promise<TokenHistory | null> =
-      preloaded && alongside.length === 0
+      // The preloaded history is the one the page fetched with no section, so
+      // it cannot answer a request that has one.
+      preloaded && alongside.length === 0 && !applied
         ? Promise.resolve(preloaded)
         : new Promise<void>((r) => {
             timer = setTimeout(r, alongside.length > 0 ? 400 : 0);
-          }).then(() => fetchHistory(mint, wallet, 300, alongside));
+          }).then(() =>
+            fetchHistory(mint, wallet, 300, alongside, applied ?? undefined),
+          );
     void load.then((h) => {
       if (cancelled) return;
       setRaw(toMarketCap(shape(h)));
@@ -625,6 +682,15 @@ export function WalletReplay({
         subject.current = `${mint}|${wallet}`;
         setRelated(null);
         setFolded(new Set());
+        /**
+         * A different wallet is a different chart over a different span, so a
+         * section picked on the last one means nothing on this one. Both are
+         * already null on the common path, and React bails out of a set to the
+         * value it is holding — so this refetches only when a section really
+         * was applied, which is exactly when it should.
+         */
+        setPicked(null);
+        setApplied(null);
       }
 
       // Always, whatever the toggle says. See `playing`.
@@ -634,7 +700,7 @@ export function WalletReplay({
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [mint, wallet, preloaded, alongside]);
+  }, [mint, wallet, preloaded, alongside, applied]);
 
   // Build the chart once per display mode. Switching mode swaps the series
   // type, which means a fresh chart rather than a mutated one.
@@ -736,7 +802,6 @@ export function WalletReplay({
    */
   const marks = useMemo(() => {
     if (!data) return [];
-    const iv = data.interval;
 
     /**
      * Grouped per wallet as well as per side once a cluster is being replayed:
@@ -745,15 +810,27 @@ export function WalletReplay({
      */
     const grouped = new Map<
       string,
-      { time: number; isBuy: boolean; usd: number; wallet?: string | null }
+      { time: number; bar: number; isBuy: boolean; usd: number; wallet?: string | null }
     >();
     for (const t of data.trades) {
       if (t.kind === "transfer" || !(t.usd > 0)) continue;
-      const time = Math.floor(t.ts / iv) * iv;
+      /**
+       * The bar index is CARRIED, not recovered from the time later on.
+       *
+       * `time / interval` was a bar index only while every bar was the same
+       * width and the series started at a multiple of it. With a finer section
+       * spliced in, neither holds — a marker two thirds of the way along a
+       * 400-bar chart came out at bar 29,790,000, and the collision test that
+       * spaces the labels compared it against nothing.
+       */
+      const i = barAt(data.candles, t.ts);
+      if (i < 0) continue;
+      const time = data.candles[i]?.t ?? t.ts;
       const who = alongside.length > 0 ? (t.wallet ?? "") : "";
-      const key = `${time}:${t.isBuy}:${who}`;
+      const key = `${i}:${t.isBuy}:${who}`;
       const at = grouped.get(key) ?? {
         time,
+        bar: i,
         isBuy: t.isBuy,
         usd: 0,
         wallet: t.wallet,
@@ -763,32 +840,70 @@ export function WalletReplay({
     }
 
     const all = [...grouped.values()];
-    const label = (g: { isBuy: boolean; usd: number; wallet?: string | null }) =>
-      `${g.isBuy ? "BUY" : "SELL"} ${usdCompact(g.usd)}` +
-      (alongside.length > 0 && g.wallet ? ` ${g.wallet.slice(0, 4)}` : "");
+    type Marker = (typeof all)[number];
+    const keyOf = (g: Marker) => `${g.time}:${g.isBuy}:${g.wallet ?? ""}`;
+    const tag = (g: Marker) =>
+      alongside.length > 0 && g.wallet ? ` ${g.wallet.slice(0, 4)}` : "";
+
+    /**
+     * Two ways to write the same marker, and the shorter one is not a
+     * degradation — the side is already in the colour and in which way the
+     * marker hangs off the bar, so "SELL" is the one part of the label that
+     * repeats what the reader can see.
+     */
+    const full = (g: Marker) =>
+      `${g.isBuy ? "BUY" : "SELL"} ${usdCompact(g.usd)}${tag(g)}`;
+    const compact = (g: Marker) => `${usdCompact(g.usd)}${tag(g)}`;
 
     /** Rough width of a marker label. The font is ~11px; this is close enough
      *  to keep neighbours apart without measuring text on a canvas. */
     const widthOf = (text: string) => text.length * 6.2 + 10;
 
-    // Buys sit below the bar and sells above it, so the two sides are laid out
-    // independently and only collide with their own kind.
-    const placed: Record<"buy" | "sell", { bar: number; half: number }[]> = {
-      buy: [],
-      sell: [],
+    /** Which of one side's markers can carry `write` without overlapping. */
+    const place = (side: Marker[], write: (g: Marker) => string) => {
+      const kept = new Set<string>();
+      const placed: { bar: number; half: number }[] = [];
+      for (const g of side) {
+        const half = widthOf(write(g)) / 2;
+        const clear = placed.every(
+          (other) => Math.abs(other.bar - g.bar) * BAR_SPACING >= other.half + half,
+        );
+        if (!clear) continue;
+        placed.push({ bar: g.bar, half });
+        kept.add(keyOf(g));
+      }
+      return kept;
     };
-    const labelled = new Set<string>();
 
-    for (const g of [...all].sort((a, b) => b.usd - a.usd)) {
-      const side = g.isBuy ? "buy" : "sell";
-      const half = widthOf(label(g)) / 2;
-      const bar = g.time / iv;
-      const clear = placed[side].every(
-        (other) => Math.abs(other.bar - bar) * BAR_SPACING >= other.half + half,
-      );
-      if (!clear) continue;
-      placed[side].push({ bar, half });
-      labelled.add(`${g.time}:${g.isBuy}:${g.wallet ?? ""}`);
+    /**
+     * Full labels where they all fit, short ones where they do not.
+     *
+     * The rule used to be one form and silence for whatever collided with it,
+     * which is the right call against a $20 fill crowding a $40,000 one and
+     * the wrong one against two big sells minutes apart — and zooming into a
+     * section is precisely what turns the second case from rare into normal.
+     * MEASURED on Frank's exit: two sells six one-minute bars apart, 54px of
+     * room, 81px wanted as "SELL $167.2K" and "SELL $74.1K" — so the smaller
+     * one lost its text. Dropping the word costs 31px and keeps both.
+     *
+     * Chosen per side and applied to all of that side, because a row where
+     * some markers say SELL and others do not reads as two kinds of event.
+     * Buys and sells are laid out independently — they sit on opposite sides
+     * of the bar and cannot collide with each other.
+     */
+    const text = new Map<string, string>();
+    for (const isBuy of [true, false]) {
+      const side = all
+        .filter((g) => g.isBuy === isBuy)
+        // Biggest first: the space goes to the trades worth reading, and a
+        // smaller one inside the room an already-placed label needs stays a dot.
+        .sort((a, b) => b.usd - a.usd);
+      const long = place(side, full);
+      const short = long.size === side.length ? long : place(side, compact);
+      const better = short.size > long.size;
+      const write = better ? compact : full;
+      const kept = better ? short : long;
+      for (const g of side) if (kept.has(keyOf(g))) text.set(keyOf(g), write(g));
     }
 
     // Ascending, because the library requires markers in time order.
@@ -799,9 +914,7 @@ export function WalletReplay({
         position: g.isBuy ? "belowBar" : "aboveBar",
         color: g.isBuy ? "#3fd08a" : "#ff5c5c",
         shape: "circle",
-        text: labelled.has(`${g.time}:${g.isBuy}:${g.wallet ?? ""}`)
-          ? label(g)
-          : "",
+        text: text.get(keyOf(g)) ?? "",
       }));
   }, [data, alongside]);
 
@@ -1106,7 +1219,7 @@ export function WalletReplay({
             asCap,
             point,
             trades: data.trades.filter(
-              (t) => t.ts <= (data.candles[bar]?.t ?? 0) + data.interval,
+              (t) => barAt(data.candles, t.ts) <= bar,
             ).length,
             flashes:
               cursor >= 0 ? flashesAtClip(filled, cursor, clipMs, caps) : [],
@@ -1399,7 +1512,7 @@ export function WalletReplay({
               value={
                 data
                   ? data.trades.filter(
-                      (t) => t.ts <= (data.candles[at]?.t ?? 0) + data.interval,
+                      (t) => barAt(data.candles, t.ts) <= at,
                     ).length
                   : 0
               }
@@ -1517,8 +1630,12 @@ export function WalletReplay({
                   setZoom(z);
                   setAt(i < 0 ? Math.max((next?.candles.length ?? 1) - 1, 0) : i);
                 }}
-                disabled={!raw || locked}
-                title={`${barLabel((raw?.interval ?? 15) * z)} bars`}
+                disabled={!raw || locked || Boolean(raw?.zoom)}
+                title={
+                  raw?.zoom
+                    ? "not available while a zoom section is shown"
+                    : `${barLabel((raw?.interval ?? 15) * z)} bars`
+                }
                 className={cx(
                   "cursor-pointer rounded-xs border px-2 py-1.5 font-mono text-[10px] tracking-[0.1em] uppercase disabled:opacity-40",
                   zoom === z
@@ -1653,9 +1770,148 @@ export function WalletReplay({
             className="min-w-[140px] flex-1 accent-amber"
           />
           <span className="tnum font-mono text-[11px] text-tx3">
-            {total ? at + 1 : 0}/{total} · {barLabel(data?.interval ?? 15)}
+            {total ? at + 1 : 0}/{total} ·{" "}
+            {data?.zoom
+              ? `${barLabel(data.interval)} / ${barLabel(data.zoom.interval)}`
+              : barLabel(data?.interval ?? 15)}
           </span>
         </div>
+
+        {/*
+          * Draw one stretch of the replay at a finer bar width.
+          *
+          * Shown only for a token that HAS finer bars stored — see `zoomable`
+          * — so the control appears where it can be answered from the cache
+          * and nowhere else. Dragging it never starts a build.
+          *
+          * The sliders move one fine bar per notch: the server fills the
+          * part-bars at each edge, so a section really can begin and end on
+          * the minute. Arrow keys nudge one notch, and `here` snaps an edge to
+          * the scrubber, which is the usable way to hit an exact moment on a
+          * range this long.
+          */}
+        {raw?.zoomable && span && (
+          <div className="mt-4 border-t border-line pt-3">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <span className="font-mono text-[9.5px] tracking-[0.14em] text-amber uppercase">
+                Zoom section
+              </span>
+              <span className="font-mono text-[10px] text-tx3">
+                {barLabel(span.fine)} bars inside the range, {barLabel(raw.interval)}{" "}
+                outside
+              </span>
+            </div>
+
+            <div className="mt-2.5 flex flex-col gap-1.5">
+              {(["from", "to"] as const).map((edge) => (
+                <label key={edge} className="flex items-center gap-2">
+                  <span className="w-8 font-mono text-[10px] text-tx3 uppercase">
+                    {edge}
+                  </span>
+                  <input
+                    type="range"
+                    disabled={locked}
+                    /**
+                     * The SELECTABLE range, not the current selection.
+                     *
+                     * These were `span.from`/`span.to`, which made each handle
+                     * sit exactly on its own bound — `from` was always at min
+                     * and `to` always at max — so every drag snapped straight
+                     * back and neither slider could be moved at all.
+                     */
+                    min={span.min}
+                    max={span.max}
+                    /**
+                     * A FINE bar per notch, not a coarse one.
+                     *
+                     * The section used to be widened to the nearest coarse
+                     * boundary, so anything smaller than a notch of two hours
+                     * would have been a precision the answer did not have. The
+                     * edges are filled from part-bars now, so a section can
+                     * begin and end on the minute and the slider says so.
+                     * Arrow keys move one notch, which is the accurate way to
+                     * place an edge on a range this long.
+                     */
+                    step={span.fine}
+                    value={span[edge]}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      // From the CLAMPED span rather than the stored pick:
+                      // the pick survives a change of wallet and the bounds do
+                      // not, so reading it raw can start from a range the new
+                      // wallet's chart never had. The handles may not cross —
+                      // each stops a bar short of the other.
+                      setPicked(
+                        edge === "from"
+                          ? { from: Math.min(v, span.to - span.fine), to: span.to }
+                          : { from: span.from, to: Math.max(v, span.from + span.fine) },
+                      );
+                    }}
+                    className="min-w-[140px] flex-1 accent-amber"
+                  />
+                  <span className="tnum w-[128px] shrink-0 text-right font-mono text-[10px] text-tx2">
+                    {stamp(span[edge])}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={locked}
+                    title="here"
+                    onClick={() =>
+                      setPicked(
+                        edge === "from"
+                          ? {
+                              from: Math.min(
+                                Math.max(barTime(data, at), span.min),
+                                span.to - span.fine,
+                              ),
+                              to: span.to,
+                            }
+                          : {
+                              from: span.from,
+                              to: Math.max(
+                                Math.min(barTime(data, at), span.max),
+                                span.from + span.fine,
+                              ),
+                            },
+                      )
+                    }
+                    className="shrink-0 cursor-pointer rounded-xs border border-line-strong px-1.5 py-1 font-mono text-[9px] tracking-[0.1em] text-tx3 uppercase hover:text-tx2 disabled:cursor-default disabled:opacity-40"
+                  >
+                    here
+                  </button>
+                </label>
+              ))}
+            </div>
+
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              <span className="tnum font-mono text-[10px] text-tx3">
+                {barLabel(span.to - span.from)} ·{" "}
+                {Math.round((span.to - span.from) / span.fine).toLocaleString()}{" "}
+                fine bars
+                {tooManyBars ? ` · over the ${ZOOM_MAX_BARS.toLocaleString()} cap` : ""}
+              </span>
+              <button
+                type="button"
+                disabled={locked || tooManyBars || span.to <= span.from}
+                onClick={() => setApplied({ from: span.from, to: span.to })}
+                className="cursor-pointer rounded-xs border border-amber/40 bg-amber/10 px-3 py-1.5 font-mono text-[10px] tracking-[0.1em] text-amber uppercase hover:bg-amber/20 disabled:cursor-default disabled:opacity-40"
+              >
+                apply
+              </button>
+              <button
+                type="button"
+                disabled={locked || !applied}
+                onClick={() => {
+                  setApplied(null);
+                  setZoom(1);
+                }}
+                className="cursor-pointer rounded-xs border border-line-strong px-3 py-1.5 font-mono text-[10px] tracking-[0.1em] text-tx3 uppercase hover:text-tx2 disabled:cursor-default disabled:opacity-40"
+              >
+                clear
+              </button>
+            </div>
+          </div>
+        )}
 
         {now && (related || findingRelated || hasGraph === false) && (
           <div className="mt-4 border-t border-line pt-4">

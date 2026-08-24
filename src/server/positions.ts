@@ -421,8 +421,20 @@ export class PositionBook {
     let soldUsd = 0;
     const out: ReplayPoint[] = [];
 
-    for (const minute of minutes) {
-      const cutoff = minute + intervalSec;
+    for (let k = 0; k < minutes.length; k += 1) {
+      const minute = minutes[k] as number;
+      /**
+       * A bucket ends where the NEXT one starts, not a fixed width later.
+       *
+       * The two are the same thing on an evenly spaced chart and stop being
+       * the same the moment a finer section is spliced into a coarser one,
+       * where a two-hour bar can be followed by a one-minute bar. Taking the
+       * end from the neighbour books every fill exactly once whatever the
+       * widths are; adding a constant would sweep the next 119 minutes of
+       * fills into the bar before them. The width is still needed for the
+       * last bucket, which has no neighbour.
+       */
+      const cutoff = minutes[k + 1] ?? minute + intervalSec;
       while (i < fills.length && fills[i]!.ts < cutoff) {
         const f = fills[i]!;
         if (f.isBuy) {
