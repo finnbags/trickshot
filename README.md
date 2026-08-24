@@ -101,6 +101,8 @@ Worth knowing before trusting a number.
     src/server/graph      a wallet's counterparties
     src/server/store      anything built, kept between requests
     src/components        the chart, the replay, the boards
+    src/lib/record        the replay, recorded to MP4
+    src/lib/sound         a till on a sell, a fanfare every $20K
 
 The reasoning behind each decision — and the measurements that forced it — is in
 the comments, next to the code it explains.

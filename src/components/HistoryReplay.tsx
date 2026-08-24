@@ -584,10 +584,17 @@ function Board({
                   {r.name}
                 </span>
               )}
+              {/*
+                The clipping lives on this BLOCK, not on the address inside it.
+                `truncate` needs a box with a width to clip against, and an
+                inline element has neither — so the full address rendered at
+                its natural width and ran straight through the copy button and
+                the figures beside it.
+              */}
               <span
                 title={r.wallet}
                 className={cx(
-                  "font-mono",
+                  "block min-w-0 truncate font-mono",
                   r.name ? "text-[10px] text-tx3" : "text-[11.5px] text-tx2",
                 )}
               >
@@ -596,15 +603,13 @@ function Board({
                 <span className="sm:hidden">
                   {r.wallet.slice(0, 6)}…{r.wallet.slice(-6)}
                 </span>
-                <span className="hidden truncate select-all sm:inline">
-                  {r.wallet}
-                </span>
+                <span className="hidden select-all sm:inline">{r.wallet}</span>
               </span>
             </span>
             <Copy value={r.wallet} label="wallet address" />
           </span>
 
-          <span className="flex items-center gap-3 pl-7 sm:gap-2 sm:pl-0">
+          <span className="flex items-center gap-3 pl-7 sm:shrink-0 sm:gap-2 sm:pl-0">
             <span
               title="First trade to last — or to now, if still holding"
               className="tnum shrink-0 font-mono text-[10.5px] text-tx3"
