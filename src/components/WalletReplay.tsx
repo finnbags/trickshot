@@ -721,14 +721,14 @@ export function WalletReplay({
 
   return (
     <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 z-[100] flex items-start justify-center overflow-y-auto bg-black/75 p-2 sm:items-center sm:p-4"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-[1040px] rounded-md border border-line-strong bg-ink-900 p-6"
+        className="my-auto w-full max-w-[1040px] rounded-md border border-line-strong bg-ink-900 p-4 sm:p-6"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="mb-4 flex items-start justify-between gap-4">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div className="min-w-0">
             <Label>Wallet replay</Label>
             {label && (
@@ -749,7 +749,7 @@ export function WalletReplay({
                 title={wallet}
                 className={cx(
                   "truncate font-mono select-all",
-                  label ? "text-[11px] text-tx3" : "text-[15px] font-bold text-tx",
+                  label ? "text-[11px] text-tx3" : "text-[13px] font-bold text-tx sm:text-[15px]",
                 )}
               >
                 {wallet}
@@ -757,10 +757,10 @@ export function WalletReplay({
               <Copy value={wallet} label="wallet address" />
             </div>
           </div>
-          <div className="text-right">
+          <div className="text-left sm:text-right">
             <div
               className={cx(
-                "tnum font-mono text-[44px] leading-none font-bold",
+                "tnum font-mono text-[32px] leading-none font-bold sm:text-[44px]",
                 up ? "text-mint" : "text-signal",
               )}
             >
@@ -856,7 +856,7 @@ export function WalletReplay({
         )}
 
         {now && (
-          <div className="mt-4 grid grid-cols-6 gap-4">
+          <div className="mt-4 grid grid-cols-3 gap-3 sm:grid-cols-6 sm:gap-4">
             {/* Bought and sold first: they are what the viewer is watching the
                 wallet DO, and the PnL figures below are the consequence. Both
                 are as of the current bar, not lifetime. */}
@@ -1080,7 +1080,7 @@ export function WalletReplay({
                   return (
                     <label
                       key={r.wallet}
-                      className="mt-2 flex cursor-pointer items-start gap-3 rounded-xs border border-line px-3 py-2 hover:bg-ink-800"
+                      className="mt-2 flex cursor-pointer flex-wrap items-start gap-x-3 gap-y-1 rounded-xs border border-line px-3 py-2 hover:bg-ink-800"
                     >
                       <input
                         type="checkbox"
@@ -1095,7 +1095,7 @@ export function WalletReplay({
                         }
                         className="mt-0.5 accent-amber"
                       />
-                      <span className="min-w-0 flex-1">
+                      <span className="min-w-0 flex-1 basis-[60%]">
                         <span className="flex flex-wrap items-baseline gap-2">
                           {r.name && (
                             <span className="font-mono text-[12px] font-medium text-tx">
@@ -1171,7 +1171,7 @@ function Figure({
       <div className="font-mono text-[9.5px] tracking-[0.14em] text-tx3 uppercase">
         {label}
       </div>
-      <div className={cx("tnum mt-1 font-mono text-[17px] font-bold", tone)}>
+      <div className={cx("tnum mt-1 font-mono text-[15px] font-bold sm:text-[17px]", tone)}>
         {plain
           ? value
           : `${signed && value >= 0 ? "+" : signed ? "−" : ""}${usdCompact(Math.abs(value))}`}

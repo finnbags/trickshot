@@ -521,51 +521,68 @@ function Board({
            the browser resolves by dropping one of them. */
         <div
           key={r.wallet}
-          className="flex w-full items-center gap-2 border-b border-line px-4 py-2.5 last:border-b-0 hover:bg-ink-700"
+          /* Two lines on a phone, one on a desktop. Seven things competing for
+             one row left nothing for the address, which is the only part that
+             identifies the wallet. */
+          className="flex w-full flex-col gap-1.5 border-b border-line px-4 py-2.5 last:border-b-0 hover:bg-ink-700 sm:flex-row sm:items-center sm:gap-2"
         >
-          <span className="tnum w-5 font-mono text-[11px] text-tx3">{i + 1}</span>
-          <span className="flex min-w-0 flex-1 flex-col">
-            {r.name && (
+          <span className="flex min-w-0 items-center gap-2 sm:flex-1">
+            <span className="tnum w-5 shrink-0 font-mono text-[11px] text-tx3">
+              {i + 1}
+            </span>
+            <span className="flex min-w-0 flex-1 flex-col">
+              {r.name && (
+                <span
+                  title={r.category ?? r.name}
+                  className="truncate font-mono text-[11.5px] font-medium text-tx"
+                >
+                  {r.name}
+                </span>
+              )}
               <span
-                title={r.category ?? r.name}
-                className="truncate font-mono text-[11.5px] font-medium text-tx"
+                title={r.wallet}
+                className={cx(
+                  "font-mono",
+                  r.name ? "text-[10px] text-tx3" : "text-[11.5px] text-tx2",
+                )}
               >
-                {r.name}
+                {/* Ends only where there is no room for the middle. The copy
+                    button is what people actually use to take the address. */}
+                <span className="sm:hidden">
+                  {r.wallet.slice(0, 6)}…{r.wallet.slice(-6)}
+                </span>
+                <span className="hidden truncate select-all sm:inline">
+                  {r.wallet}
+                </span>
               </span>
-            )}
+            </span>
+            <Copy value={r.wallet} label="wallet address" />
+          </span>
+
+          <span className="flex items-center gap-3 pl-7 sm:gap-2 sm:pl-0">
             <span
-              title={r.wallet}
+              title="First trade to last — or to now, if still holding"
+              className="tnum shrink-0 font-mono text-[10.5px] text-tx3"
+            >
+              {r.heldSec ? `held ${duration(r.heldSec)}` : "—"}
+            </span>
+            <span className="tnum shrink-0 font-mono text-[10.5px] text-tx3">
+              {r.trades} trades
+            </span>
+            <span
               className={cx(
-                "truncate font-mono select-all",
-                r.name ? "text-[10px] text-tx3" : "text-[11.5px] text-tx2",
+                "tnum ml-auto text-right font-mono text-[12.5px] font-bold sm:ml-0 sm:w-24",
+                tone === "mint" ? "text-mint" : "text-signal",
               )}
             >
-              {r.wallet}
+              {r.total >= 0 ? "+" : "−"}
+              {usdCompact(Math.abs(r.total))}
             </span>
+            <PlayButton
+              onClick={() => onPlay(r.wallet, r.name)}
+              label={`Replay ${r.name ?? r.wallet}`}
+            />
           </span>
-          <Copy value={r.wallet} label="wallet address" />
-          <span
-            title="First trade to last — or to now, if still holding"
-            className="tnum shrink-0 font-mono text-[10.5px] text-tx3"
-          >
-            {r.heldSec ? `held ${duration(r.heldSec)}` : "—"}
-          </span>
-          <span className="tnum shrink-0 font-mono text-[10.5px] text-tx3">
-            {r.trades} trades
-          </span>
-          <span
-            className={cx(
-              "tnum w-24 text-right font-mono text-[12.5px] font-bold",
-              tone === "mint" ? "text-mint" : "text-signal",
-            )}
-          >
-            {r.total >= 0 ? "+" : "−"}
-            {usdCompact(Math.abs(r.total))}
-          </span>
-          <PlayButton
-            onClick={() => onPlay(r.wallet, r.name)}
-            label={`Replay ${r.name ?? r.wallet}`}
-          />
         </div>
       ))}
       </div>
