@@ -23,6 +23,7 @@ const TX2 = "#98a2b0";
 const TX3 = "#7a8494";
 const MINT = "#35d399";
 const SIGNAL = "#ff5a5a";
+const AMBER = "#ffb224";
 const LINE = "#242a33";
 
 /**
@@ -61,6 +62,8 @@ export interface FrameState {
   layout: Layout;
   /** The chart exactly as drawn, at export resolution. */
   shot: HTMLCanvasElement | null;
+  /** The token's symbol. Empty when the chain never gave one. */
+  ticker?: string;
   label?: string;
   wallet: string;
   /** Whether the figures are market caps, which changes the flash suffix. */
@@ -184,12 +187,35 @@ function paintHeader(ctx: CanvasRenderingContext2D, s: FrameState): void {
   const cap = (size: number) => size * 0.72;
   const drop = (size: number) => size * 0.22;
 
-  const nameSize = 42 * t;
+  /**
+   * The left column, top to bottom: which token, then which wallet.
+   *
+   * Built as a list because the ticker is optional — a mint the chain never
+   * named has no symbol to show, and the column has to close up rather than
+   * leave a gap where one would have been.
+   */
   const addrSize = s.label ? 30 * t : 40 * t;
-  const lead = 46 * t;
-  const leftH = s.label
-    ? cap(nameSize) + lead + drop(addrSize)
-    : cap(addrSize) + drop(addrSize);
+  const lines: { text: string; size: number; weight: number; color: string }[] =
+    [];
+  if (s.ticker) {
+    lines.push({ text: s.ticker, size: 30 * t, weight: 800, color: AMBER });
+  }
+  if (s.label) {
+    lines.push({ text: s.label, size: 42 * t, weight: 800, color: TX });
+  }
+  lines.push({
+    text: address,
+    size: addrSize,
+    weight: s.label ? 500 : 800,
+    color: s.label ? TX2 : TX,
+  });
+
+  /** Baseline-to-baseline, indexed by the line the gap sits above. */
+  const leads = lines.map((l) => (l.size > 36 * t ? 46 * t : 40 * t));
+  const leftH =
+    cap(lines[0].size) +
+    leads.slice(1).reduce((a, b) => a + b, 0) +
+    drop(lines[lines.length - 1].size);
 
   const pnlSize = 92 * t;
   const capSize = 19 * t;
@@ -200,19 +226,16 @@ function paintHeader(ctx: CanvasRenderingContext2D, s: FrameState): void {
   const foot = r.y + r.h - 30 * t;
   const mid = foot - Math.max(leftH, rightH) / 2;
 
-  const leftTop = mid - leftH / 2;
-  if (s.label) {
-    draw(ctx, s.label, L.pad, leftTop + cap(nameSize), {
-      size: nameSize, weight: 800,
+  let y = mid - leftH / 2 + cap(lines[0].size);
+  lines.forEach((line, i) => {
+    if (i > 0) y += leads[i];
+    draw(ctx, line.text, L.pad, y, {
+      size: line.size,
+      weight: line.weight,
+      color: line.color,
+      tracking: line.color === AMBER ? 2 * t : 0,
     });
-    draw(ctx, address, L.pad, leftTop + cap(nameSize) + lead, {
-      size: addrSize, weight: 500, color: TX2,
-    });
-  } else {
-    draw(ctx, address, L.pad, leftTop + cap(addrSize), {
-      size: addrSize, weight: 800,
-    });
-  }
+  });
 
   const rightTop = mid - rightH / 2;
   draw(ctx, signed(pnl), L.w - L.pad, rightTop + cap(pnlSize), {
@@ -442,6 +465,12 @@ function paintOutro(ctx: CanvasRenderingContext2D, s: FrameState): void {
   // Rises a little as it arrives, the same gesture the fill labels make.
   const lift = (1 - appear) * 26 * t;
 
+  if (s.ticker) {
+    draw(ctx, s.ticker, L.w / 2, top - 126 * t - lift, {
+      size: 34 * t, weight: 800, color: AMBER, align: "center",
+      tracking: 2.4 * t, alpha: appear,
+    });
+  }
   draw(ctx, s.label ?? shortAddress(s.wallet, 8), L.w / 2, top - 74 * t - lift, {
     size: 34 * t, weight: 800, color: TX2, align: "center", alpha: appear,
   });

@@ -517,6 +517,8 @@ export function WalletReplay({
   const [tooLong, setTooLong] = useState<number | null>(null);
   /** Shows the frames as they are encoded, where the chart usually sits. */
   const previewRef = useRef<HTMLCanvasElement>(null);
+  /** The token's symbol, which only the exported frame shows. */
+  const [ticker, setTicker] = useState("");
   /**
    * What this browser can encode. Asked once, and asked ASYNCHRONOUSLY —
    * WebCodecs answers with a promise, so unlike the check this replaced there
@@ -597,15 +599,22 @@ export function WalletReplay({
      * A cluster reload is a real request, so it waits a moment: ticking three
      * wallets in a row should fetch once, not three times.
      */
-    const load =
+    const load: Promise<TokenHistory | null> =
       preloaded && alongside.length === 0
-        ? Promise.resolve(shape(preloaded))
+        ? Promise.resolve(preloaded)
         : new Promise<void>((r) => {
             timer = setTimeout(r, alongside.length > 0 ? 400 : 0);
-          }).then(() => fetchHistory(mint, wallet, 300, alongside).then(shape));
-    void load.then((d) => {
+          }).then(() => fetchHistory(mint, wallet, 300, alongside));
+    void load.then((h) => {
       if (cancelled) return;
-      setRaw(toMarketCap(d));
+      setRaw(toMarketCap(shape(h)));
+      /**
+       * Which token this is, for the exported frame to say.
+       *
+       * `shape` deliberately keeps only what the chart consumes, so the symbol
+       * would be thrown away here — it is read off the history before that.
+       */
+      setTicker((h?.symbol ?? h?.name ?? "").trim().toUpperCase());
       setAt(0);
       /**
        * A different wallet's graph is not this wallet's — but a CLUSTER change
@@ -1091,6 +1100,7 @@ export function WalletReplay({
           paint(ctx, {
             layout,
             shot: a.chart.takeScreenshot(),
+            ticker,
             label,
             wallet,
             asCap,
@@ -1139,6 +1149,7 @@ export function WalletReplay({
     shape,
     soundOn,
     speed,
+    ticker,
     wallet,
   ]);
 
