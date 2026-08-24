@@ -544,7 +544,13 @@ function Board({
             </span>
           </span>
           <Copy value={r.wallet} label="wallet address" />
-          <span className="tnum font-mono text-[10.5px] text-tx3">
+          <span
+            title="First trade to last — or to now, if still holding"
+            className="tnum shrink-0 font-mono text-[10.5px] text-tx3"
+          >
+            {r.heldSec ? `held ${duration(r.heldSec)}` : "—"}
+          </span>
+          <span className="tnum shrink-0 font-mono text-[10.5px] text-tx3">
             {r.trades} trades
           </span>
           <span

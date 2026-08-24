@@ -67,6 +67,8 @@ export interface HistoryTrader {
   soldUsd: number;
   trades: number;
   qty: number;
+  /** First trade to last, or to now while still holding, in seconds. */
+  heldSec?: number;
 }
 
 export interface TokenHistory {

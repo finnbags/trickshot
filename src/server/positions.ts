@@ -91,6 +91,14 @@ export interface PnlRow {
   unrealized: number;
   total: number;
   trades: number;
+  /**
+   * How long the wallet has been in this token, in seconds.
+   *
+   * First trade to last, or to NOW while it is still holding — a position
+   * opened last week and never closed has been held for a week, not for the
+   * few minutes it took to buy.
+   */
+  heldSec: number;
   unknownBasis: boolean;
   /** |cash-flow total − (realized+unrealized)|. Should be ~0. */
   basisDrift: number;
@@ -150,6 +158,12 @@ const MAX_WALLETS_PER_MINT = Number(process.env.MAX_WALLETS_PER_MINT ?? 400);
  * guess about where the tokens came from.
  */
 const UNKNOWN_BASIS_RATIO = Number(process.env.UNKNOWN_BASIS_RATIO ?? 0.05);
+
+/** See `PnlRow.heldSec`. */
+function heldFor(p: Position): number {
+  const until = p.qty > 0 ? Math.floor(Date.now() / 1000) : p.lastTs;
+  return Math.max(until - p.firstTs, 0);
+}
 
 function unknownBasis(p: Position): boolean {
   /**
@@ -302,6 +316,7 @@ export class PositionBook {
         unrealized,
         total,
         trades: p.buys + p.sells,
+        heldSec: heldFor(p),
         unknownBasis: unknown,
         basisDrift: Math.abs(total - (p.realized + unrealized)),
       });
@@ -332,6 +347,7 @@ export class PositionBook {
         unrealized: p.qty * price - p.costBasis,
         total: p.cash + p.qty * price,
         trades: p.buys + p.sells,
+        heldSec: heldFor(p),
         unknownBasis: unknownBasis(p),
         basisDrift: 0,
       }))
