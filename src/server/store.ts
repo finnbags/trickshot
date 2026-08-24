@@ -574,7 +574,20 @@ export async function galleryTokens(limit = INDEX_MAX): Promise<BuiltToken[]> {
   const rows = await query(
     `select=*&coverage=eq.full&order=built_at.desc&limit=${limit}`,
   );
-  if (rows) return rows.map(fromRow);
+  if (rows && rows.length > 0) return rows.map(fromRow);
+
+  /**
+   * An empty table is not the same as an authoritative "no tokens".
+   *
+   * Row-level security filters rows rather than refusing the request, so a key
+   * without access gets 200 and `[]` — indistinguishable from a table nobody
+   * has written yet. Treating that as the answer emptied a live gallery that
+   * had ten tokens sitting in the blob beside it.
+   *
+   * Consulting the blob when the table says nothing costs one read on an
+   * install that has genuinely built nothing, and is the difference between a
+   * migration that degrades and one that takes the site down.
+   */
   const all = await loadBlob<BuiltToken[]>(INDEX_KEY);
   return (all ?? []).filter((t) => (t.coverage ?? "full") === "full").slice(0, limit);
 }
@@ -587,7 +600,9 @@ export async function galleryTokens(limit = INDEX_MAX): Promise<BuiltToken[]> {
  */
 export async function tokenRow(mint: string): Promise<BuiltToken | null> {
   const rows = await query(`select=*&mint=eq.${encodeURIComponent(mint)}&limit=1`);
-  if (rows) return rows[0] ? fromRow(rows[0]) : null;
+  if (rows && rows[0]) return fromRow(rows[0]);
+  // A miss falls through for the same reason `galleryTokens` does: under RLS a
+  // blocked read is an empty result, not an error.
   const all = await loadBlob<BuiltToken[]>(INDEX_KEY);
   return (all ?? []).find((t) => t.mint === mint) ?? null;
 }

@@ -223,6 +223,27 @@ export function callerIp(request: Request): string {
  * second source of truth, and the one that is wrong is always the one on the
  * dashboard.
  */
+/** Does a counter write actually reach Postgres? */
+async function probeShared(): Promise<boolean> {
+  const remote = supabase();
+  if (!remote) return false;
+  try {
+    const res = await fetch(`${remote.url}/rest/v1/rpc/${TABLE_RPC}`, {
+      method: "POST",
+      headers: {
+        apikey: remote.key,
+        authorization: `Bearer ${remote.key}`,
+        "content-type": "application/json",
+      },
+      signal: AbortSignal.timeout(5_000),
+      body: JSON.stringify({ counter_id: "probe:shared", amount: 0, ttl_seconds: 60 }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export async function usage(): Promise<{
   disabled: boolean;
   shared: boolean;
@@ -247,7 +268,13 @@ export async function usage(): Promise<{
      * one lambda's share and the real total is higher by however many are warm.
      * Worth saying plainly on a page whose whole job is to be trusted.
      */
-    shared: supabase() !== null,
+    /**
+     * Whether the counter actually round-tripped, not merely whether Supabase
+     * is configured. The first version reported the configuration and said
+     * "true" while every write was being silently refused, which is precisely
+     * the reassurance this field must never give.
+     */
+    shared: supabase() !== null && (await probeShared()),
     credits: {
       spent,
       limit: DAILY_CREDITS,
