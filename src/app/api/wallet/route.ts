@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { owner, readOnly } from "@/server/config";
 import { identify, tokenIdentity } from "@/server/identity";
 import { tokenRow } from "@/server/store";
-import { callerIp } from "@/server/budget";
+import { buildsLeft, callerIp } from "@/server/budget";
 import { withCaller } from "@/server/meter";
 import { queued } from "@/server/queue";
 import { tradedOnMany } from "@/server/history";
@@ -128,6 +128,14 @@ async function handle(request: Request) {
     return NextResponse.json({
       wallet,
       name,
+      /**
+       * Told up front, not on refusal.
+       *
+       * Every row that is not indexed costs a build to open, and a visitor
+       * with one left should know that before they spend it on the wrong
+       * token rather than after.
+       */
+      builds: await buildsLeft(callerIp(request)),
       /** Token accounts looked at, and how many were set aside. */
       scanned,
       /** Airdrops by the price/balance heuristic, plus anything never traded. */

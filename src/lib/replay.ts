@@ -297,6 +297,8 @@ export interface WalletToken {
 export interface WalletTokens {
   wallet: string;
   name?: string;
+  /** New tokens this visitor may still build today. */
+  builds?: { used: number; limit: number };
   /** Token accounts looked at. */
   scanned: number;
   /** Rows set aside as airdrops, so the page can offer to show them. */

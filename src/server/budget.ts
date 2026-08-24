@@ -137,7 +137,7 @@ export interface Allowance {
   reason?: "disabled" | "budget" | "ip" | "wallet" | "total" | "busy";
 }
 
-const BUILDS_PER_IP = Number(process.env.VISITOR_BUILDS_PER_IP ?? 20);
+const BUILDS_PER_IP = Number(process.env.VISITOR_BUILDS_PER_IP ?? 3);
 const BUILDS_PER_WALLET = Number(process.env.VISITOR_BUILDS_PER_WALLET ?? 20);
 
 /**
@@ -228,6 +228,18 @@ export async function mayBuild(
 }
 
 /** The caller's address, as far as the platform will say. */
+/**
+ * What this visitor has left today, for the page to say so plainly.
+ *
+ * Read with a zero bump, the same counter `mayBuild` increments, so the number
+ * on screen cannot drift from the one actually enforced — a limit a visitor
+ * discovers only by hitting it reads as the site being broken.
+ */
+export async function buildsLeft(ip: string): Promise<{ used: number; limit: number }> {
+  const used = await bump(`build:ip:${today()}:${ip}`, 0, 24 * 3_600);
+  return { used: Math.max(0, used), limit: BUILDS_PER_IP };
+}
+
 export function callerIp(request: Request): string {
   const forwarded = request.headers.get("x-forwarded-for");
   if (forwarded) return forwarded.split(",")[0]!.trim();

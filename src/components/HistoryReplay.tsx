@@ -409,6 +409,29 @@ export function HistoryReplay({
                   {ownerTokens.truncated && " · more further down"}
                 </p>
 
+                {/*
+                  What they have left, before they spend it.
+                  
+                  Every row marked "not indexed yet" costs one of these to
+                  open. A visitor who learns the limit by hitting it has
+                  already spent their last one on whichever token they happened
+                  to click first, which reads as the site refusing at random.
+                */}
+                {ownerTokens.builds && (
+                  <p
+                    className={cx(
+                      "mt-1 font-mono text-[11px]",
+                      ownerTokens.builds.used >= ownerTokens.builds.limit
+                        ? "text-signal"
+                        : "text-tx3",
+                    )}
+                  >
+                    {ownerTokens.builds.used >= ownerTokens.builds.limit
+                      ? "No new tokens left to build today — rows marked ready still replay."
+                      : `${ownerTokens.builds.limit - ownerTokens.builds.used} of ${ownerTokens.builds.limit} new tokens left to build today.`}
+                  </p>
+                )}
+
                 {ownerTokens.tokens.length === 0 && (
                   <p className="mt-2 font-mono text-[11px] text-tx3">
                     Nothing here but the money side of trades — SOL and
