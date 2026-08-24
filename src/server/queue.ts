@@ -142,6 +142,8 @@ const KEY = "jobs:queue";
 const MAX_DEPTH = Number(process.env.QUEUE_MAX_DEPTH ?? 50);
 /** Distinct charts one job may carry. See `merge`. */
 const MAX_WINDOWS = Number(process.env.QUEUE_MAX_WINDOWS ?? 6);
+/** Must match `BUILD_MAX_BARS`: never queue what the worker will refuse. */
+const MAX_BARS = Number(process.env.BUILD_MAX_BARS ?? 1_000);
 const MAX_ATTEMPTS = Number(process.env.QUEUE_MAX_ATTEMPTS ?? 2);
 /** A claim older than this is assumed dead and may be taken again. */
 const STALE_SEC = Number(process.env.QUEUE_STALE_SEC ?? 900);
@@ -201,7 +203,22 @@ function merge(windows: Window[], next?: Window): Window[] {
    * adds everything in between for nothing.
    */
   const held = windows.find(
-    (w) => w.interval === next.interval && next.from <= w.to && next.to >= w.from,
+    (w) =>
+      w.interval === next.interval &&
+      next.from <= w.to &&
+      next.to >= w.from &&
+      /**
+       * And only if the union is still buildable.
+       *
+       * Overlapping is not enough: two windows that each fit can union into
+       * one that does not, and the worker then refuses it every tick — the
+       * job is claimed, fails instantly, returns to the queue, and because
+       * ordering is by demand a popular one sits at the front doing that
+       * forever. MEASURED: a 1,323-bar union blocking four other tokens.
+       */
+      Math.ceil(
+        (Math.max(w.to, next.to) - Math.min(w.from, next.from)) / w.interval,
+      ) <= MAX_BARS,
   );
   if (!held) {
     // Bounded: a token nobody agrees on the shape of is not worth unbounded
@@ -420,7 +437,8 @@ export async function claim(): Promise<Job | null> {
 
 export async function finish(
   mint: string,
-  outcome: { ok: boolean; error?: string },
+  /** `terminal` marks a failure retrying cannot fix, so it does not requeue. */
+  outcome: { ok: boolean; error?: string; terminal?: boolean },
 ): Promise<void> {
   const remote = supabase();
   if (remote) {
@@ -430,6 +448,8 @@ export async function finish(
     const attempts = rows?.[0]?.attempts ?? MAX_ATTEMPTS;
     const status = outcome.ok
       ? "done"
+      : outcome.terminal
+        ? "failed"
       : // Back in the queue while it has attempts left; a token that keeps
         // failing is usually one with no readable pool, and retrying for ever
         // is a way to spend money on the same disappointment.
@@ -460,7 +480,8 @@ export async function finish(
     // Back in the queue while it has attempts left; a token that keeps failing
     // is usually one with no readable pool, and retrying it for ever is just a
     // way to spend money on the same disappointment.
-    job.status = job.attempts >= MAX_ATTEMPTS ? "failed" : "queued";
+    job.status =
+      outcome.terminal || job.attempts >= MAX_ATTEMPTS ? "failed" : "queued";
     job.error = outcome.error;
   }
   job.finishedAt = nowSec();

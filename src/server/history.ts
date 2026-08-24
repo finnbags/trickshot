@@ -2252,11 +2252,20 @@ export const VISITOR_LIMITS: ReplayLimits = {
   // Comfortably clear of the sixty-bar padding floor.
   buildBars: Number(process.env.VISITOR_MAX_BARS ?? 500),
   /**
-   * MEASURED against real windows rather than picked: an ordinary wallet's
-   * window on a busy token costs about 4,000, and the ones that genuinely
-   * belong in the queue cost 33,000 to 63,000. Ten thousand sits in the gap.
+   * Set from what queueing actually BUYS, not from the credits alone.
+   *
+   * Ten thousand looked like the gap between ordinary and expensive, and in
+   * production it queued a sixty-four bar window the estimator priced at
+   * 10,010 — a build that takes three seconds. Sending that round the queue
+   * costs the visitor a minute's wait and the site a whole tick, to save
+   * nothing: nobody else was asking for it.
+   *
+   * The queue earns its keep on work measured in tens of seconds, where the
+   * dedup matters and the wait is unavoidable anyway. Twenty-five thousand is
+   * roughly a hundred and fifty sampled bars, about seven seconds — past that,
+   * waiting is the better answer; short of it, waiting is theatre.
    */
-  credits: Number(process.env.VISITOR_MAX_CREDITS ?? 10_000),
+  credits: Number(process.env.VISITOR_MAX_CREDITS ?? 25_000),
 };
 
 /**

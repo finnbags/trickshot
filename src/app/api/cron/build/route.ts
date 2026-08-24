@@ -36,7 +36,8 @@ export const maxDuration = 800;
  * one function's time and the account's rate limit — for no gain a shorter
  * interval does not already give.
  */
-const PER_TICK = Number(process.env.QUEUE_PER_TICK ?? 1);
+const PER_TICK = Number(process.env.QUEUE_PER_TICK ?? 3);
+const MAX_BARS = Number(process.env.BUILD_MAX_BARS ?? 1_000);
 
 export async function GET(request: Request) {
   /**
@@ -98,8 +99,28 @@ export async function GET(request: Request) {
         continue;
       }
 
+      /**
+       * A window past the bar cap can never be built, so it must not be
+       * retried. Left as an ordinary failure it was claimed every tick,
+       * refused, and requeued — and since the queue is ordered by demand, a
+       * popular one held the front of the line indefinitely.
+       */
+      const tooBig = windows.filter(
+        (w) => Math.ceil((w.to - w.from) / w.interval) > MAX_BARS,
+      );
+      if (tooBig.length === windows.length) {
+        await finish(job.mint, {
+          ok: false,
+          error: "window too large to build",
+          terminal: true,
+        });
+        built.push({ mint: job.mint, ok: false, error: "window too large" });
+        await releaseBuildSlot();
+        continue;
+      }
+
       let bars = 0;
-      for (const w of windows) {
+      for (const w of windows.filter((w) => !tooBig.includes(w))) {
         bars += await buildWindow(job.mint, w.interval, w.from, w.to);
       }
 
