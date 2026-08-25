@@ -338,13 +338,29 @@ function paintWash(
   s: FrameState,
   placed: Placed[],
 ): void {
+  /**
+   * Whether this frame carries both signs at once.
+   *
+   * Two washes of opposite sign centred on their own labels still met in the
+   * middle and cancelled to a neutral grey — the same defect the screen had,
+   * and it has to be fixed identically here or an export stops matching the
+   * replay it is of. See `WASH` in WalletReplay for the measured colours.
+   */
+  const split =
+    placed.some((p) => p.f.wash > 0 && p.f.isBuy) &&
+    placed.some((p) => p.f.wash > 0 && !p.f.isBuy);
+
   for (const p of placed) {
     if (p.f.wash <= 0) continue;
     const tint = p.f.isBuy ? "53, 211, 153" : "255, 90, 90";
-    // Wide enough to surround the text rather than halo it.
-    const radius = Math.max(p.width * 0.95, 320 * p.k);
-    const cx = p.x + p.width / 2;
-    const cy = p.y - 9 * p.k;
+    // Wide enough to surround the text rather than halo it. Split washes are
+    // anchored off-frame instead, so they need to reach across it.
+    const radius = split
+      ? s.layout.w * 0.7
+      : Math.max(p.width * 0.95, 320 * p.k);
+    // Sell from the left edge, buy from the right, matching the screen.
+    const cx = split ? (p.f.isBuy ? s.layout.w : 0) : p.x + p.width / 2;
+    const cy = split ? s.layout.h / 2 : p.y - 9 * p.k;
     const glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
     glow.addColorStop(0, `rgba(${tint}, ${0.34 * p.f.wash})`);
     glow.addColorStop(0.45, `rgba(${tint}, ${0.13 * p.f.wash})`);

@@ -176,6 +176,35 @@ let flashId = 0;
 /** How long a label holds before it leaves of its own accord. */
 const FLASH_MS = 1_400;
 
+/**
+ * The wash a fill throws, and where it is anchored.
+ *
+ * Both signs used to be `ellipse at center`, so a bar holding a buy AND a sell
+ * composited one over the other at the same point. MEASURED: sell alone is
+ * #3b1b1c at 54% saturation and buy alone #133329 at 63%, but green over red
+ * is #3a4035 at 17% — a neutral grey that reads as a white flash rather than
+ * as two fills. Anchoring each to its own edge when both are present keeps
+ * them apart, and the common single-sign bar is centred exactly as before.
+ *
+ * Spelled out as four whole class names because Tailwind scans for literals;
+ * building the string from an `at ${side}` fragment compiles and then renders
+ * nothing, because the class it names was never generated.
+ */
+const WASH = {
+  buy: {
+    center:
+      "bg-[radial-gradient(ellipse_at_center,rgba(53,211,153,0.20),transparent_70%)]",
+    split:
+      "bg-[radial-gradient(ellipse_at_right,rgba(53,211,153,0.20),transparent_70%)]",
+  },
+  sell: {
+    center:
+      "bg-[radial-gradient(ellipse_at_center,rgba(255,90,90,0.20),transparent_70%)]",
+    split:
+      "bg-[radial-gradient(ellipse_at_left,rgba(255,90,90,0.20),transparent_70%)]",
+  },
+} as const;
+
 /** Once per this much gained, the fanfare sounds. */
 const FANFARE_AT = 20_000;
 
@@ -1470,19 +1499,22 @@ export function WalletReplay({
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             {/* Only the arriving fill washes the chart. Leaving ones would
                 stack their gradients and hold the screen bright. */}
-            {flashes
-              .filter((f) => f.phase !== "out")
-              .map((f) => (
+            {(() => {
+              const arriving = flashes.filter((f) => f.phase !== "out");
+              // Only a bar carrying both signs needs separating; one that does
+              // not stays centred, so the ordinary fill looks untouched.
+              const split =
+                arriving.some((f) => f.isBuy) && arriving.some((f) => !f.isBuy);
+              return arriving.map((f) => (
                 <div
                   key={f.id}
                   className={cx(
                     "replay-wash absolute inset-0",
-                    f.isBuy
-                      ? "bg-[radial-gradient(ellipse_at_center,rgba(53,211,153,0.20),transparent_70%)]"
-                      : "bg-[radial-gradient(ellipse_at_center,rgba(255,90,90,0.20),transparent_70%)]",
+                    WASH[f.isBuy ? "buy" : "sell"][split ? "split" : "center"],
                   )}
                 />
-              ))}
+              ));
+            })()}
             {flashes.map((f) => (
               <div
                 key={`t${f.id}`}
